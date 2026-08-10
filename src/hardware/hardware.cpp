@@ -31,6 +31,7 @@
 #include "render.h"
 #include "cross.h"
 
+#undef C_SSHOT
 #if (C_SSHOT)
 #include <png.h>
 #endif

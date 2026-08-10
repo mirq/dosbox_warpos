@@ -21,6 +21,7 @@
 #include "inout.h"
 #include "vga.h"
 #include "mem.h"
+#include "mouse.h"
 
 void SVGA_S3_WriteCRTC(Bitu reg,Bitu val,Bitu iolen) {
 	switch (reg) {
@@ -508,6 +509,8 @@ Bitu SVGA_S3_GetClock(void) {
 }
 
 bool SVGA_S3_HWCursorActive(void) {
+	if (Mouse_IntegrationGuestActive() && !Mouse_IntegrationShowGuestCursor())
+		return false;
 	return (vga.s3.hgc.curmode & 0x1) != 0;
 }
 

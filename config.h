@@ -51,10 +51,9 @@
 
 /* Define to 1 to use recompiling cpu core. Can not be used together with the
    dynamic-x86 core */
-/* #undef C_DYNREC */
+#define C_DYNREC  1
 
 /* Define to 1 to enable floating point emulation */
-#define C_DYNREC 1
 #define C_FPU 1
 
 /* Define to 1 to use a x86/x64 assembly fpu core */
@@ -83,7 +82,7 @@
 #define C_OPENGL 1
 
 /* Define to 1 to enable SDL_sound support */
-/* #undef C_SDL_SOUND */
+#define C_SDL_SOUND 1
 
 /* Define to 1 if you have setpriority support */
 /* #undef C_SET_PRIORITY */
@@ -93,7 +92,7 @@
 #define C_SRECORD 1
 
 /* Define to 1 to enable screenshots, requires libpng */
-#define C_SSHOT 1
+/* #undef C_SSHOT */
 
 /* Compiler supports Core Audio headers */
 /* #undef C_SUPPORTS_COREAUDIO */

@@ -2147,11 +2147,17 @@ void CPU_Disable_SkipAutoAdjust(void) {
 
 extern Bit32s ticksDone;
 extern Bit32u ticksScheduled;
+#ifdef __MORPHOS__
+extern void DOSBOX_ResetAutoCycleController(void);
+#endif
 
 void CPU_Reset_AutoAdjust(void) {
 	CPU_IODelayRemoved = 0;
 	ticksDone = 0;
 	ticksScheduled = 0;
+#ifdef __MORPHOS__
+	DOSBOX_ResetAutoCycleController();
+#endif
 }
 
 class CPU: public Module_base {

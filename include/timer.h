@@ -20,11 +20,19 @@
 #define DOSBOX_TIMER_H
 
 /* underlying clock rate in HZ */
+#ifdef __MORPHOS__
+#include "morphos_platform.h"
+#else
 #include <SDL.h>
+#endif
 
 #define PIT_TICK_RATE 1193182
 
+#ifdef __MORPHOS__
+#define GetTicks() MORPHOS_GetTicks()
+#else
 #define GetTicks() SDL_GetTicks()
+#endif
 
 typedef void (*TIMER_TickHandler)(void);
 

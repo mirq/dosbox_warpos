@@ -25,12 +25,16 @@
 #include "regs.h"
 #include "inout.h"
 #include "dos_inc.h"
+#ifndef __MORPHOS__
 #include "SDL.h"
+#endif
 
 /* SDL by default treats numlock and scrolllock different from all other keys.
  * In recent versions this can disabled by a environment variable which we set in sdlmain.cpp
  * Define the following if this is the case */
-#if SDL_VERSION_ATLEAST(1, 2, 14)
+#ifdef __MORPHOS__
+#define CAN_USE_LOCK 1
+#elif SDL_VERSION_ATLEAST(1, 2, 14)
 #define CAN_USE_LOCK 1
 /* For lower versions of SDL we also use a slight hack to get the startup states of numclock and capslock right.
  * The proper way is in the mapper, but the repeating key is an unwanted side effect for lower versions of SDL */
@@ -603,8 +607,8 @@ static void InitBiosSegment(void) {
 	Bit8u flag1 = 0;
 	Bit8u leds = 16; /* Ack received */
 
-#if SDL_VERSION_ATLEAST(1, 2, 14)
-//Nothing, mapper handles all.
+#ifdef CAN_USE_LOCK
+// Nothing: the native mapper/frontend handles startup lock state.
 #else
 	if (startup_state_capslock) { flag1|=0x40; leds|=0x04;}
 	if (startup_state_numlock)  { flag1|=0x20; leds|=0x02;}

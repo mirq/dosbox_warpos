@@ -49,6 +49,8 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 	// every codeblock that is run sets cache.block.running to itself
 	// so the block linking knows the last executed block
 	gen_mov_direct_ptr(&cache.block.running,(DRC_PTR_SIZE_IM)decode.block);
+	if (dynrec_stats.jit_enabled)
+		gen_add_direct_word(&dynrec_stats.block_entries, 1, true);
 
 	// start with the cycles check
 	gen_mov_word_to_reg(FC_RETOP,&CPU_Cycles,true);
@@ -58,6 +60,7 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 
 	decode.cycles=0;
 	while (max_opcodes--) {
+		BeginFlagsInstruction();
 		// Init prefixes
 		decode.big_addr=cpu.code.big;
 		decode.big_op=cpu.code.big;
@@ -612,6 +615,12 @@ finish_block:
 	decode.page.index--;
 	decode.active_block->page.end=(Bit16u)decode.page.index;
 //	LOG_MSG("Created block size %d start %d end %d",decode.block->cache.size,decode.block->page.start,decode.block->page.end);
+
+	if (dynrec_stats.jit_enabled) {
+		dynrec_stats.blocks_created++;
+		dynrec_stats.instructions_translated += decode.cycles;
+		dynrec_stats.host_bytes_generated += decode.block->cache.size;
+	}
 
 	return decode.block;
 }

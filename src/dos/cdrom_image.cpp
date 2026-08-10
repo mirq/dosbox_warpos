@@ -70,7 +70,7 @@ int CDROM_Interface_Image::BinaryFile::getLength()
 	return length;
 }
 
-#if defined(C_SDL_SOUND)
+#if defined(C_SDL_SOUND) && !defined(__MORPHOS__)
 CDROM_Interface_Image::AudioFile::AudioFile(const char *filename, bool &error)
 {
 	Sound_AudioInfo desired = {AUDIO_S16, 2, 44100};
@@ -139,7 +139,11 @@ CDROM_Interface_Image::CDROM_Interface_Image(Bit8u subUnit)
 {
 	images[subUnit] = this;
 	if (refCount == 0) {
+		#ifdef __MORPHOS__
+		player.mutex = MORPHOS_CreateMutex();
+#else
 		player.mutex = SDL_CreateMutex();
+#endif
 		if (!player.channel) {
 			player.channel = MIXER_AddChannel(&CDAudioCallBack, 44100, "CDAUDIO");
 		}
@@ -154,7 +158,11 @@ CDROM_Interface_Image::~CDROM_Interface_Image()
 	if (player.cd == this) player.cd = NULL;
 	ClearTracks();
 	if (refCount == 0) {
+		#ifdef __MORPHOS__
+		MORPHOS_DestroyMutex(player.mutex);
+#else
 		SDL_DestroyMutex(player.mutex);
+#endif
 		player.channel->Enable(false);
 	}
 }
@@ -229,7 +237,11 @@ bool CDROM_Interface_Image::GetMediaTrayStatus(bool& mediaPresent, bool& mediaCh
 bool CDROM_Interface_Image::PlayAudioSector(unsigned long start,unsigned long len)
 {
 	// We might want to do some more checks. E.g valid start and length
+	#ifdef __MORPHOS__
+	MORPHOS_LockMutex(player.mutex);
+#else
 	SDL_mutexP(player.mutex);
+#endif
 	player.cd = this;
 	player.currFrame = start;
 	player.targetFrame = start + len;
@@ -242,7 +254,11 @@ bool CDROM_Interface_Image::PlayAudioSector(unsigned long start,unsigned long le
 		//Real drives either fail or succeed as well
 	} else player.isPlaying = true;
 	player.isPaused = false;
+	#ifdef __MORPHOS__
+	MORPHOS_UnlockMutex(player.mutex);
+#else
 	SDL_mutexV(player.mutex);
+#endif
 	return true;
 }
 
@@ -325,7 +341,11 @@ void CDROM_Interface_Image::CDAudioCallBack(Bitu len)
 		return;
 	}
 	
+	#ifdef __MORPHOS__
+	MORPHOS_LockMutex(player.mutex);
+#else
 	SDL_mutexP(player.mutex);
+#endif
 	while (player.bufLen < (Bits)len) {
 		bool success;
 		if (player.targetFrame > player.currFrame)
@@ -341,7 +361,11 @@ void CDROM_Interface_Image::CDAudioCallBack(Bitu len)
 			player.isPlaying = false;
 		}
 	}
+	#ifdef __MORPHOS__
+	MORPHOS_UnlockMutex(player.mutex);
+#else
 	SDL_mutexV(player.mutex);
+#endif
 	if (player.ctrlUsed) {
 		Bit16s sample0,sample1;
 		Bit16s * samples=(Bit16s *)&player.buffer;
@@ -530,7 +554,7 @@ bool CDROM_Interface_Image::LoadCueSheet(char *cuefile)
 			if (type == "BINARY") {
 				track.file = new BinaryFile(filename.c_str(), error);
 			}
-#if defined(C_SDL_SOUND)
+#if defined(C_SDL_SOUND) && !defined(__MORPHOS__)
 			//The next if has been surpassed by the else, but leaving it in as not 
 			//to break existing cue sheets that depend on this.(mine with OGG tracks specifying MP3 as type)
 			else if (type == "WAVE" || type == "AIFF" || type == "MP3") {
@@ -745,13 +769,13 @@ void CDROM_Interface_Image::ClearTracks()
 }
 
 void CDROM_Image_Destroy(Section*) {
-#if defined(C_SDL_SOUND)
+#if defined(C_SDL_SOUND) && !defined(__MORPHOS__)
 	Sound_Quit();
 #endif
 }
 
 void CDROM_Image_Init(Section* section) {
-#if defined(C_SDL_SOUND)
+#if defined(C_SDL_SOUND) && !defined(__MORPHOS__)
 	Sound_Init();
 	section->AddDestroyFunction(CDROM_Image_Destroy, false);
 #endif

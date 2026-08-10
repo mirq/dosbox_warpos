@@ -1108,8 +1108,16 @@ static void dyn_branched_exit(BranchTypes btype,Bit32s eip_add) {
 	Bitu eip_base=decode.code-decode.code_start;
 	dyn_reduce_cycles();
 
-	dyn_branchflag_to_reg(btype);
-	DRC_PTR_SIZE_IM data=gen_create_branch_on_nonzero(FC_RETOP,true);
+	DRC_PTR_SIZE_IM data;
+	const bool direct_zf = (btype == BR_Z || btype == BR_NZ) && TryDirectZFBranch();
+	if (direct_zf) {
+		if (dynrec_stats.jit_enabled) dynrec_stats.zf_jcc_direct++;
+		data = (btype == BR_Z) ? gen_create_branch_on_zero(FC_RETOP,true)
+		                         : gen_create_branch_on_nonzero(FC_RETOP,true);
+	} else {
+		dyn_branchflag_to_reg(btype);
+		data=gen_create_branch_on_nonzero(FC_RETOP,true);
+	}
 
  	// Branch not taken
 	gen_add_direct_word(&reg_eip,eip_base,decode.big_op);

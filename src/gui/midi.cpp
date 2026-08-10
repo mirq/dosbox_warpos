@@ -22,7 +22,9 @@
 #include <string>
 #include <algorithm>
 
+#ifndef __MORPHOS__
 #include "SDL.h"
+#endif
 
 #include "dosbox.h"
 #include "midi.h"
@@ -33,6 +35,9 @@
 #include "pic.h"
 #include "hardware.h"
 #include "timer.h"
+#ifdef __MORPHOS__
+#include "morphos_platform.h"
+#endif
 
 #define RAWBUF	1024
 
@@ -102,7 +107,13 @@ DB_Midi midi;
 void MIDI_RawOutByte(Bit8u data) {
 	if (midi.sysex.start) {
 		Bit32u passed_ticks = GetTicks() - midi.sysex.start;
-		if (passed_ticks < midi.sysex.delay) SDL_Delay(midi.sysex.delay - passed_ticks);
+		if (passed_ticks < midi.sysex.delay) {
+#ifdef __MORPHOS__
+			MORPHOS_Delay(midi.sysex.delay - passed_ticks);
+#else
+			SDL_Delay(midi.sysex.delay - passed_ticks);
+#endif
+		}
 	}
 
 	/* Test for a realtime MIDI message */

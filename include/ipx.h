@@ -69,8 +69,12 @@
 #pragma pack(1)
 #endif
 
-// For Uint8 type
+// SDL_net-compatible packet types are provided by the native MorphOS UDP layer.
+#ifdef __MORPHOS__
+#include "morphos_net.h"
+#else
 #include "SDL_net.h"
+#endif
 
 struct PackedIP {
 	Uint32 host;

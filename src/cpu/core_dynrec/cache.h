@@ -21,6 +21,16 @@
 #include <exec/system.h>
 class CodePageHandlerDynRec;	// forward
 
+#if defined(__MORPHOS__)
+/*
+ * MorphOS/PPC can replace the indirect cache-block exit with one relative
+ * branch.  These helpers are implemented by risc_ppc.h after the generic
+ * cache structures have been declared.
+ */
+static bool dynrec_direct_links_enabled(void);
+static bool dynrec_patch_link(Bit8u *patch, Bit8u *target);
+#endif
+
 // basic cache block representation
 class CacheBlockDynRec {
 public:
@@ -32,6 +42,19 @@ public:
 		link[index].to=toblock;
 		link[index].next=toblock->link[index].from;	// set target block
 		toblock->link[index].from=this;				// remember who links me
+#if defined(__MORPHOS__)
+		/*
+		 * G5-default path: after the first resolver pass, patch the source
+		 * block's exit to a single relative PPC branch.  The 8 MiB dynrec
+		 * cache is comfortably inside the PPC +/-32 MiB branch range.
+		 */
+		if (dynrec_direct_links_enabled() && link[index].patch) {
+			if (dynrec_patch_link(link[index].patch,toblock->cache.start))
+				dynrec_stats.direct_links_patched++;
+			else
+				dynrec_stats.direct_links_out_of_range++;
+		}
+#endif
 	}
 	struct {
 		Bit16u start,end;		// where in the page is the original code
@@ -55,6 +78,9 @@ public:
 		CacheBlockDynRec * to;		// this block can transfer control to the to-block
 		CacheBlockDynRec * next;
 		CacheBlockDynRec * from;	// the from-block can transfer control to this block
+#if defined(__MORPHOS__)
+		Bit8u * patch;			// PPC branch instruction to repatch on link/invalidation
+#endif
 	} link[2];	// maximum two links (conditional jumps)
 	CacheBlockDynRec * crossblock;
 };
@@ -423,6 +449,16 @@ void CacheBlockDynRec::Clear(void) {
 		link[ind].from=0;
 		while (fromlink) {
 			CacheBlockDynRec * nextlink=fromlink->link[ind].next;
+#if defined(__MORPHOS__)
+			/* Restore the resolver branch before the target cache bytes can be
+			 * recycled.  This is required for self-modifying DOS code. */
+			if (dynrec_direct_links_enabled() && fromlink->link[ind].patch) {
+				if (dynrec_patch_link(fromlink->link[ind].patch,link_blocks[ind].cache.start))
+					dynrec_stats.direct_links_invalidated++;
+				else
+					dynrec_stats.direct_links_out_of_range++;
+			}
+#endif
 			// clear the next-link and let the block point to the standard linkcode
 			fromlink->link[ind].next=0;
 			fromlink->link[ind].to=&link_blocks[ind];
@@ -486,6 +522,10 @@ skipresize:
 	// adjust parameters and open this block
 	block->cache.size=size;
 	block->cache.next=nextblock;
+#if defined(__MORPHOS__)
+	block->link[0].patch=0;
+	block->link[1].patch=0;
+#endif
 	cache.pos=block->cache.start;
 	return block;
 }
@@ -521,8 +561,11 @@ static void cache_closeblock(void) {
 		}
 	}
 	// advance the active block pointer
-	if (!block->cache.next || (block->cache.next->cache.start>(cache_code_start_ptr + CACHE_TOTAL - CACHE_MAXSIZE))) {
+	if (!block->cache.next || (block->cache.next->cache.start>(cache_code + CACHE_TOTAL - CACHE_MAXSIZE))) {
 //		LOG_MSG("Cache full restarting");
+#if defined(__MORPHOS__)
+		dynrec_stats.cache_restarts++;
+#endif
 		cache.block.active=cache.block.first;
 	} else {
 		cache.block.active=block->cache.next;
@@ -589,6 +632,28 @@ static void cache_block_closing(Bit8u* block_start,Bitu block_size);
 #define PAGESIZE_TEMP 4096
 #endif
 
+/* Keep the generated-code virtual colour deterministic on MorphOS.
+ * The G5 I-cache is 64 KiB/direct-mapped with 128-byte blocks; G4 builds use
+ * their 32 KiB/32-byte geometry.  cache_code itself (not merely the raw
+ * allocation) is aligned, while the fixed dynrec glue page lives immediately
+ * before it. */
+#if defined(__MORPHOS__)
+# if defined(G4)
+#  define DYNREC_CACHE_BASE_ALIGN (32 * 1024)
+# else
+#  define DYNREC_CACHE_BASE_ALIGN (64 * 1024)
+# endif
+#else
+# define DYNREC_CACHE_BASE_ALIGN PAGESIZE_TEMP
+#endif
+
+#if defined(__MORPHOS__)
+/* Process-lifetime JIT arena emitted into the executable text hunk.
+ * The 64 KiB headroom contains the dynrec glue page and aligns the
+ * first translated block; CACHE_TOTAL remains the full 8 MiB cache. */
+extern Bit8u ppc_jit_storage[CACHE_TOTAL + CACHE_MAXSIZE + 65536];
+#endif
+
 static bool cache_initialized = false;
 
 static void cache_init(bool enable) {
@@ -618,29 +683,31 @@ static void cache_init(bool enable) {
 			if (!cache_code_start_ptr)
 				cache_code_start_ptr=(Bit8u*)malloc(CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP-1+PAGESIZE_TEMP);
 #else
-
-	//For MorphOS we will try to figure out the cache line size for the aligned memory allocation
-	ULONG cachelinesize;
-	if (!NewGetSystemAttrsA(&cachelinesize, sizeof(cachelinesize), SYSTEMINFOTYPE_PPC_ICACHEL1LINESIZE, NULL))
-	{
-		//Failed: let's send a warning and use 32 byte alignment
-		//write_log("Warning: failed to read cache alignment requirement, 32 bytes alignment is used");
-		cachelinesize = 32;
-	}
-
-	
-	//Allocate memory
-	cache_code_start_ptr= (Bit8u*)AllocVecAligned(CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP-1+PAGESIZE_TEMP, MEMF_ANY, cachelinesize, 0);
-	//	cache_code_start_ptr=(Bit8u*)malloc(CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP-1+PAGESIZE_TEMP);
-			
+# if defined(__MORPHOS__)
+	/* Keep the complete dynrec arena in the executable text hunk.
+	 * ppc_jit_storage is 64 KiB aligned and includes the original
+	 * CACHE_MAXSIZE tail used while closing the final block. */
+	cache_code_start_ptr = ppc_jit_storage;
+# else
+	const Bitu cache_alloc_size = CACHE_TOTAL + CACHE_MAXSIZE +
+	                              PAGESIZE_TEMP + DYNREC_CACHE_BASE_ALIGN;
+	cache_code_start_ptr = (Bit8u *)malloc(cache_alloc_size);
+# endif
 #endif
 			if(!cache_code_start_ptr) E_Exit("Allocating dynamic cache failed");
 
-			// align the cache at a page boundary
-			cache_code=(Bit8u*)(((Bitu)cache_code_start_ptr + PAGESIZE_TEMP-1) & ~(PAGESIZE_TEMP-1));//Bitu is same size as a pointer.
-
-			cache_code_link_blocks=cache_code;
-			cache_code=cache_code+PAGESIZE_TEMP;
+			/* Reserve the preceding page for dyn_run_code/link stubs and make the
+			 * first translated block start at a deterministic cache-size boundary. */
+			const Bitu aligned_code = ((Bitu)cache_code_start_ptr + PAGESIZE_TEMP +
+			                           DYNREC_CACHE_BASE_ALIGN - 1) &
+			                          ~(Bitu)(DYNREC_CACHE_BASE_ALIGN - 1);
+			cache_code = (Bit8u *)aligned_code;
+			cache_code_link_blocks = cache_code - PAGESIZE_TEMP;
+#if defined(__MORPHOS__)
+			dynrec_stats.cache_code_address = (Bitu)cache_code;
+			dynrec_stats.cache_base_alignment = DYNREC_CACHE_BASE_ALIGN;
+			dynrec_stats.cache_block_alignment = CACHE_ALIGN;
+#endif
 
 #if (C_HAVE_MPROTECT)
 			if(mprotect(cache_code_link_blocks,CACHE_TOTAL+CACHE_MAXSIZE+PAGESIZE_TEMP,PROT_WRITE|PROT_READ|PROT_EXEC))

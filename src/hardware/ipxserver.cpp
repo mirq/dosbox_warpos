@@ -27,6 +27,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ipx.h"
+#ifdef __MORPHOS__
+#include "morphos_net.h"
+#define SDLNet_GetError MORPHOSNet_GetError
+#define SDLNet_ResolveHost MORPHOSNet_ResolveHost
+#define SDLNet_UDP_Open MORPHOSNet_UDP_Open
+#define SDLNet_UDP_Close MORPHOSNet_UDP_Close
+#define SDLNet_UDP_Send MORPHOSNet_UDP_Send
+#define SDLNet_UDP_Recv MORPHOSNet_UDP_Recv
+#define SDLNet_Read16 MORPHOSNet_Read16
+#define SDLNet_Write16 MORPHOSNet_Write16
+#define SDLNet_Write32 MORPHOSNet_Write32
+#endif
 
 IPaddress ipxServerIp;  // IPAddress for server's listening port
 UDPsocket ipxServerSocket;  // Listening server socket

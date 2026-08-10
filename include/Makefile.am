@@ -36,5 +36,13 @@ shell.h \
 support.h \
 timer.h \
 vga.h \
-video.h
-
+video.h \
+morphos_audio.h \
+morphos_altivec.h \
+morphos_platform.h \
+morphos_net.h morphos_sana2.h ne2000.h \
+morphos_socket_compat.h \
+morphos_runtime.h \
+morphos_video.h \
+morphos_voodoo_tinygl.h \
+voodoo.h

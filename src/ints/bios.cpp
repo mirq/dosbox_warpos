@@ -895,64 +895,88 @@ static Bitu INT15_Handler(void) {
 	case 0xc2:	/* BIOS PS2 Pointing Device Support */
 		switch (reg_al) {
 		case 0x00:		// enable/disable
-			if (reg_bh==0) {	// disable
+			if (reg_bh==0) {
 				Mouse_SetPS2State(false);
 				reg_ah=0;
 				CALLBACK_SCF(false);
-			} else if (reg_bh==0x01) {	//enable
-				if (!Mouse_SetPS2State(true)) {
-					reg_ah=5;
+			} else if (reg_bh==0x01) {
+				if (!Mouse_PS2CallbackInstalled() || !Mouse_SetPS2State(true)) {
+					reg_ah=5; // no far call installed
 					CALLBACK_SCF(true);
-					break;
+				} else {
+					reg_ah=0;
+					CALLBACK_SCF(false);
 				}
+			} else {
+				reg_ah=2; // invalid input
+				CALLBACK_SCF(true);
+			}
+			break;
+		case 0x01:		// reset, preserving selected packet size
+			Mouse_PS2Reset();
+			reg_bh=Mouse_PS2GetType();
+			reg_bl=0xaa; // device self-test completed
+			reg_ah=0;
+			CALLBACK_SCF(false);
+			break;
+		case 0x02:		// set sampling rate (BH=0..6)
+			if (!Mouse_PS2SetSamplingRate(reg_bh)) {
+				reg_ah=2;
+				CALLBACK_SCF(true);
+			} else {
+				reg_ah=0;
+				CALLBACK_SCF(false);
+			}
+			break;
+		case 0x03:		// set resolution (BH=0..3)
+			if (!Mouse_PS2SetResolution(reg_bh)) {
+				reg_ah=2;
+				CALLBACK_SCF(true);
+			} else {
+				reg_ah=0;
+				CALLBACK_SCF(false);
+			}
+			break;
+		case 0x04:		// get type
+			reg_bh=Mouse_PS2GetType();
+			reg_ah=0;
+			CALLBACK_SCF(false);
+			break;
+		case 0x05:		// initialize interface and select packet size
+			if (!Mouse_PS2Initialize(reg_bh)) {
+				reg_ah=2;
+				CALLBACK_SCF(true);
+			} else {
+				reg_ah=0;
+				CALLBACK_SCF(false);
+			}
+			break;
+		case 0x06:		// return status or change scaling
+			if (reg_bh==0x00) {
+				Mouse_PS2GetStatus(reg_bl,reg_cl,reg_dl);
+				reg_ah=0;
+				CALLBACK_SCF(false);
+			} else if (reg_bh==0x01) {
+				Mouse_PS2SetScaling(false);
+				reg_ah=0;
+				CALLBACK_SCF(false);
+			} else if (reg_bh==0x02) {
+				Mouse_PS2SetScaling(true);
 				reg_ah=0;
 				CALLBACK_SCF(false);
 			} else {
-				CALLBACK_SCF(true);
-				reg_ah=1;
-			}
-			break;
-		case 0x01:		// reset
-			reg_bx=0x00aa;	// mouse
-			// fall through
-		case 0x05:		// initialize
-			if ((reg_al==0x05) && (reg_bh!=0x03)) {
-				// non-standard data packet sizes not supported
-				CALLBACK_SCF(true);
 				reg_ah=2;
-				break;
-			}
-			Mouse_SetPS2State(false);
-			CALLBACK_SCF(false);
-			reg_ah=0;
-			break;
-		case 0x02:		// set sampling rate
-		case 0x03:		// set resolution
-			CALLBACK_SCF(false);
-			reg_ah=0;
-			break;
-		case 0x04:		// get type
-			reg_bh=0;	// ID
-			CALLBACK_SCF(false);
-			reg_ah=0;
-			break;
-		case 0x06:		// extended commands
-			if ((reg_bh==0x01) || (reg_bh==0x02)) {
-				CALLBACK_SCF(false); 
-				reg_ah=0;
-			} else {
 				CALLBACK_SCF(true);
-				reg_ah=1;
 			}
 			break;
-		case 0x07:		// set callback
+		case 0x07:		// set/remove callback ES:BX
 			Mouse_ChangePS2Callback(SegValue(es),reg_bx);
-			CALLBACK_SCF(false);
 			reg_ah=0;
+			CALLBACK_SCF(false);
 			break;
 		default:
+			reg_ah=1; // invalid function
 			CALLBACK_SCF(true);
-			reg_ah=1;
 			break;
 		}
 		break;

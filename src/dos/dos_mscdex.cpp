@@ -289,6 +289,10 @@ int CMscdex::AddDrive(Bit16u _drive, char* physicalPath, Bit8u& subUnit)
 		// Always use IOCTL in Linux or OS/2
 		cdrom[numDrives] = new CDROM_Interface_Ioctl();
 		LOG(LOG_MISC,LOG_NORMAL)("MSCDEX: IOCTL Interface.");
+#elif defined(__MORPHOS__)
+        /* Physical CD access has no SDL fallback in the native port. */
+        cdrom[numDrives] = new CDROM_Interface_Fake();
+        LOG(LOG_MISC,LOG_NORMAL)("MSCDEX: MorphOS directory/fake CD interface.");
 #else
 		// Default case windows and other oses
 		cdrom[numDrives] = new CDROM_Interface_SDL();

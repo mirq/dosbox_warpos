@@ -41,6 +41,9 @@ using namespace std;
 #include "inout.h"
 #include "mixer.h"
 #include "timer.h"
+#ifdef __MORPHOS__
+#include "morphos_platform.h"
+#endif
 #include "paging.h"
 #include "support.h"
 #include "shell.h"
@@ -1837,7 +1840,11 @@ Bitu DEBUG_Loop(void) {
 	Bit16u oldCS	= SegValue(cs);
 	Bit32u oldEIP	= reg_eip;
 	PIC_runIRQs();
+	#ifdef __MORPHOS__
+	MORPHOS_Delay(1);
+	#else
 	SDL_Delay(1);
+	#endif
 	if ((oldCS!=SegValue(cs)) || (oldEIP!=reg_eip)) {
 		CBreakpoint::AddBreakpoint(oldCS,oldEIP,true);
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);

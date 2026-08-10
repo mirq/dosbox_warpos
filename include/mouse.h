@@ -26,6 +26,14 @@ void Mouse_ShowCursor(void);
 void Mouse_HideCursor(void);
 
 bool Mouse_SetPS2State(bool use);
+bool Mouse_PS2CallbackInstalled(void);
+void Mouse_PS2Reset(void);
+bool Mouse_PS2Initialize(Bit8u packet_size);
+bool Mouse_PS2SetSamplingRate(Bit8u rate_code);
+bool Mouse_PS2SetResolution(Bit8u resolution);
+void Mouse_PS2SetScaling(bool scaling_21);
+Bit8u Mouse_PS2GetType(void);
+void Mouse_PS2GetStatus(Bit8u &status, Bit8u &resolution, Bit8u &sample_rate);
 
 void Mouse_ChangePS2Callback(Bit16u pseg, Bit16u pofs);
 
@@ -38,5 +46,17 @@ void Mouse_ButtonReleased(Bit8u button);
 void Mouse_AutoLock(bool enable);
 void Mouse_BeforeNewVideoMode(bool setmode);
 void Mouse_AfterNewVideoMode(bool setmode);
+
+/* DOSBox-X integration I/O device used by the Windows 3.1 and Windows 95
+ * absolute-pointer drivers. */
+bool Mouse_IntegrationConfigured(void);
+bool Mouse_IntegrationGuestActive(void);
+bool Mouse_IntegrationShowHostCursor(void);
+bool Mouse_IntegrationShowGuestCursor(void);
+void Mouse_IntegrationHostPosition(Bit16u x, Bit16u y, Bit16u width, Bit16u height);
+void Mouse_IntegrationSetLocked(bool locked);
+#if defined(__MORPHOS__)
+void Mouse_IntegrationStateChanged(void);
+#endif
 
 #endif

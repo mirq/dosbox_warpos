@@ -51,6 +51,11 @@ static struct MemoryBlock {
 		PageHandler *mmiohandler;
 	} lfb;
 	struct {
+		Bitu start_page;
+		Bitu end_page;
+		PageHandler *handler;
+	} voodoo;
+	struct {
 		bool enabled;
 		Bit8u controlport;
 	} a20;
@@ -140,8 +145,26 @@ PageHandler * MEM_GetPageHandler(Bitu phys_page) {
 	} else if ((phys_page>=memory.lfb.start_page+0x01000000/4096) &&
 				(phys_page<memory.lfb.start_page+0x01000000/4096+16)) {
 		return memory.lfb.mmiohandler;
+	} else if (memory.voodoo.handler && phys_page >= memory.voodoo.start_page &&
+	           phys_page < memory.voodoo.end_page) {
+		return memory.voodoo.handler;
 	}
 	return &illegal_page_handler;
+}
+
+
+void MEM_SetVoodooLFB(Bitu page, Bitu pages, PageHandler *handler) {
+	memory.voodoo.start_page = page;
+	memory.voodoo.end_page = page + pages;
+	memory.voodoo.handler = handler;
+	PAGING_ClearTLB();
+}
+
+void MEM_ClearVoodooLFB(void) {
+	memory.voodoo.start_page = 0;
+	memory.voodoo.end_page = 0;
+	memory.voodoo.handler = 0;
+	PAGING_ClearTLB();
 }
 
 void MEM_SetPageHandler(Bitu phys_page,Bitu pages,PageHandler * handler) {

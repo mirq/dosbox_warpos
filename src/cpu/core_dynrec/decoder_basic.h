@@ -511,14 +511,28 @@ static INLINE void dyn_set_eip_end(HostReg reg,Bit32u imm=0) {
 // is architecture dependent
 // R=host register; I=32bit immediate value; A=address value; m=memory
 
+// Most backends already use a call encoding large enough for
+// gen_fill_function_ptr().  PPC distinguishes compact calls from the fixed
+// 16-byte sites required by lazy-flags rewriting.  Keep a generic fallback so
+// the architecture-independent decoder remains portable.
+#ifndef DRC_HAS_PATCHABLE_FUNCTION_CALLS
+static void INLINE gen_call_function_patchable(void * func) {
+	gen_call_function_raw(func);
+}
+
+static DRC_PTR_SIZE_IM INLINE gen_call_function_setup_patchable(void * func,Bitu paramcount,bool fastcall=false) {
+	return gen_call_function_setup(func,paramcount,fastcall);
+}
+#endif
+
 static DRC_PTR_SIZE_IM INLINE gen_call_function_R(void * func,Bitu op) {
 	gen_load_param_reg(op,0);
 	return gen_call_function_setup(func, 1);
 }
 
-static DRC_PTR_SIZE_IM INLINE gen_call_function_R3(void * func,Bitu op) {
+static DRC_PTR_SIZE_IM INLINE gen_call_function_R3_patchable(void * func,Bitu op) {
 	gen_load_param_reg(op,2);
-	return gen_call_function_setup(func, 3, true);
+	return gen_call_function_setup_patchable(func, 3, true);
 }
 
 static DRC_PTR_SIZE_IM INLINE gen_call_function_RI(void * func,Bitu op1,Bitu op2) {
@@ -698,9 +712,11 @@ bool DRC_CALL_CONV mem_readb_checked_drc(PhysPt address) DRC_FC;
 bool DRC_CALL_CONV mem_readb_checked_drc(PhysPt address) {
 	HostPt tlb_addr=get_tlb_read(address);
 	if (tlb_addr) {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_read_slow_other++;
 		*((Bit8u*)(&core_dynrec.readdata))=host_readb(tlb_addr+address);
 		return false;
 	} else {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_read_slow_tlb++;
 		return get_tlb_readhandler(address)->readb_checked(address, (Bit8u*)(&core_dynrec.readdata));
 	}
 }
@@ -709,9 +725,13 @@ bool DRC_CALL_CONV mem_writeb_checked_drc(PhysPt address,Bit8u val) DRC_FC;
 bool DRC_CALL_CONV mem_writeb_checked_drc(PhysPt address,Bit8u val) {
 	HostPt tlb_addr=get_tlb_write(address);
 	if (tlb_addr) {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_write_slow_other++;
 		host_writeb(tlb_addr+address,val);
 		return false;
-	} else return get_tlb_writehandler(address)->writeb_checked(address,val);
+	} else {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_write_slow_tlb++;
+		return get_tlb_writehandler(address)->writeb_checked(address,val);
+	}
 }
 
 bool DRC_CALL_CONV mem_readw_checked_drc(PhysPt address) DRC_FC;
@@ -719,10 +739,20 @@ bool DRC_CALL_CONV mem_readw_checked_drc(PhysPt address) {
 	if ((address & 0xfff)<0xfff) {
 		HostPt tlb_addr=get_tlb_read(address);
 		if (tlb_addr) {
+			if (dynrec_stats.mem_enabled) {
+				if (address & 1) dynrec_stats.mem_read_slow_unaligned++;
+				else dynrec_stats.mem_read_slow_other++;
+			}
 			*((Bit16u*)(&core_dynrec.readdata))=host_readw(tlb_addr+address);
 			return false;
-		} else return get_tlb_readhandler(address)->readw_checked(address, (Bit16u*)(&core_dynrec.readdata));
-	} else return mem_unalignedreadw_checked(address, ((Bit16u*)(&core_dynrec.readdata)));
+		} else {
+			if (dynrec_stats.mem_enabled) dynrec_stats.mem_read_slow_tlb++;
+			return get_tlb_readhandler(address)->readw_checked(address, (Bit16u*)(&core_dynrec.readdata));
+		}
+	} else {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_read_slow_page_cross++;
+		return mem_unalignedreadw_checked(address, ((Bit16u*)(&core_dynrec.readdata)));
+	}
 }
 
 bool DRC_CALL_CONV mem_readd_checked_drc(PhysPt address) DRC_FC;
@@ -730,10 +760,20 @@ bool DRC_CALL_CONV mem_readd_checked_drc(PhysPt address) {
 	if ((address & 0xfff)<0xffd) {
 		HostPt tlb_addr=get_tlb_read(address);
 		if (tlb_addr) {
+			if (dynrec_stats.mem_enabled) {
+				if (address & 3) dynrec_stats.mem_read_slow_unaligned++;
+				else dynrec_stats.mem_read_slow_other++;
+			}
 			*((Bit32u*)(&core_dynrec.readdata))=host_readd(tlb_addr+address);
 			return false;
-		} else return get_tlb_readhandler(address)->readd_checked(address, (Bit32u*)(&core_dynrec.readdata));
-	} else return mem_unalignedreadd_checked(address, ((Bit32u*)(&core_dynrec.readdata)));
+		} else {
+			if (dynrec_stats.mem_enabled) dynrec_stats.mem_read_slow_tlb++;
+			return get_tlb_readhandler(address)->readd_checked(address, (Bit32u*)(&core_dynrec.readdata));
+		}
+	} else {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_read_slow_page_cross++;
+		return mem_unalignedreadd_checked(address, ((Bit32u*)(&core_dynrec.readdata)));
+	}
 }
 
 bool DRC_CALL_CONV mem_writew_checked_drc(PhysPt address,Bit16u val) DRC_FC;
@@ -741,10 +781,20 @@ bool DRC_CALL_CONV mem_writew_checked_drc(PhysPt address,Bit16u val) {
 	if ((address & 0xfff)<0xfff) {
 		HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) {
+			if (dynrec_stats.mem_enabled) {
+				if (address & 1) dynrec_stats.mem_write_slow_unaligned++;
+				else dynrec_stats.mem_write_slow_other++;
+			}
 			host_writew(tlb_addr+address,val);
 			return false;
-		} else return get_tlb_writehandler(address)->writew_checked(address,val);
-	} else return mem_unalignedwritew_checked(address,val);
+		} else {
+			if (dynrec_stats.mem_enabled) dynrec_stats.mem_write_slow_tlb++;
+			return get_tlb_writehandler(address)->writew_checked(address,val);
+		}
+	} else {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_write_slow_page_cross++;
+		return mem_unalignedwritew_checked(address,val);
+	}
 }
 
 bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,Bit32u val) DRC_FC;
@@ -752,10 +802,20 @@ bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,Bit32u val) {
 	if ((address & 0xfff)<0xffd) {
 		HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) {
+			if (dynrec_stats.mem_enabled) {
+				if (address & 3) dynrec_stats.mem_write_slow_unaligned++;
+				else dynrec_stats.mem_write_slow_other++;
+			}
 			host_writed(tlb_addr+address,val);
 			return false;
-		} else return get_tlb_writehandler(address)->writed_checked(address,val);
-	} else return mem_unalignedwrited_checked(address,val);
+		} else {
+			if (dynrec_stats.mem_enabled) dynrec_stats.mem_write_slow_tlb++;
+			return get_tlb_writehandler(address)->writed_checked(address,val);
+		}
+	} else {
+		if (dynrec_stats.mem_enabled) dynrec_stats.mem_write_slow_page_cross++;
+		return mem_unalignedwrited_checked(address,val);
+	}
 }
 
 
@@ -763,12 +823,44 @@ bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,Bit32u val) {
 
 // read a byte from a given address and store it in reg_dst
 static void dyn_read_byte(HostReg reg_addr,HostReg reg_dst) {
+#if defined(DRC_PPC_TLB_FAST_READ)
+	if (dynrec_stats.mem_fast_enabled) {
+		const Bit32u slow_tlb = gen_ppc_tlb_read_lookup(reg_addr);
+		gen_ppc_direct_read_byte(reg_dst, reg_addr);
+		if (dynrec_stats.mem_enabled)
+			gen_add_direct_word(&dynrec_stats.mem_read_fast_hits, 1, true);
+		const Bit32u done = gen_ppc_branch_always();
+		gen_fill_branch_long(slow_tlb);
+		gen_mov_regs(FC_OP1,reg_addr);
+		gen_call_function_raw((void *)&mem_readb_checked_drc);
+		dyn_check_exception(FC_RETOP);
+		gen_mov_byte_to_reg_low(reg_dst,&core_dynrec.readdata);
+		gen_fill_branch_long(done);
+		return;
+	}
+#endif
 	gen_mov_regs(FC_OP1,reg_addr);
 	gen_call_function_raw((void *)&mem_readb_checked_drc);
 	dyn_check_exception(FC_RETOP);
 	gen_mov_byte_to_reg_low(reg_dst,&core_dynrec.readdata);
 }
 static void dyn_read_byte_canuseword(HostReg reg_addr,HostReg reg_dst) {
+#if defined(DRC_PPC_TLB_FAST_READ)
+	if (dynrec_stats.mem_fast_enabled) {
+		const Bit32u slow_tlb = gen_ppc_tlb_read_lookup(reg_addr);
+		gen_ppc_direct_read_byte(reg_dst, reg_addr);
+		if (dynrec_stats.mem_enabled)
+			gen_add_direct_word(&dynrec_stats.mem_read_fast_hits, 1, true);
+		const Bit32u done = gen_ppc_branch_always();
+		gen_fill_branch_long(slow_tlb);
+		gen_mov_regs(FC_OP1,reg_addr);
+		gen_call_function_raw((void *)&mem_readb_checked_drc);
+		dyn_check_exception(FC_RETOP);
+		gen_mov_byte_to_reg_low_canuseword(reg_dst,&core_dynrec.readdata);
+		gen_fill_branch_long(done);
+		return;
+	}
+#endif
 	gen_mov_regs(FC_OP1,reg_addr);
 	gen_call_function_raw((void *)&mem_readb_checked_drc);
 	dyn_check_exception(FC_RETOP);
@@ -777,6 +869,36 @@ static void dyn_read_byte_canuseword(HostReg reg_addr,HostReg reg_dst) {
 
 // write a byte from reg_val into the memory given by the address
 static void dyn_write_byte(HostReg reg_addr,HostReg reg_val) {
+#if defined(DRC_PPC_TLB_FAST_WRITE)
+	if (dynrec_stats.mem_write_fast_enabled) {
+		/* r8/r9 are lookup temporaries.  Current decoder call sites use r29
+		 * for the address and r3/r4 for the value, so the normal G5 path emits
+		 * no operand copies.  Keep conditional scratch copies for future call
+		 * sites that might hand us a lookup register. */
+		HostReg fast_addr=reg_addr;
+		HostReg fast_val=reg_val;
+		if (fast_addr==HOST_R8 || fast_addr==HOST_R9) {
+			gen_mov_regs(HOST_R11,fast_addr);
+			fast_addr=HOST_R11;
+		}
+		if (fast_val==HOST_R8 || fast_val==HOST_R9) {
+			gen_mov_regs(HOST_R12,fast_val);
+			fast_val=HOST_R12;
+		}
+		const Bit32u slow_tlb = gen_ppc_tlb_write_lookup(fast_addr);
+		gen_ppc_direct_write_byte(fast_val,fast_addr);
+		if (dynrec_stats.mem_enabled)
+			gen_add_direct_word(&dynrec_stats.mem_write_fast_hits, 1, true);
+		const Bit32u done = gen_ppc_branch_always();
+		gen_fill_branch_long(slow_tlb);
+		gen_mov_regs(FC_OP2,fast_val);
+		gen_mov_regs(FC_OP1,fast_addr);
+		gen_call_function_raw((void *)&mem_writeb_checked_drc);
+		dyn_check_exception(FC_RETOP);
+		gen_fill_branch_long(done);
+		return;
+	}
+#endif
 	gen_mov_regs(FC_OP2,reg_val);
 	gen_mov_regs(FC_OP1,reg_addr);
 	gen_call_function_raw((void *)&mem_writeb_checked_drc);
@@ -786,6 +908,27 @@ static void dyn_write_byte(HostReg reg_addr,HostReg reg_val) {
 // read a 32bit (dword=true) or 16bit (dword=false) value
 // from a given address and store it in reg_dst
 static void dyn_read_word(HostReg reg_addr,HostReg reg_dst,bool dword) {
+#if defined(DRC_PPC_TLB_FAST_READ)
+	if (dynrec_stats.mem_fast_enabled) {
+		/* The byte-reversed indexed loads are used only for naturally aligned
+		 * accesses.  Unaligned x86 accesses remain in the checked C helper. */
+		const Bit32u slow_unaligned = gen_ppc_unaligned_branch(reg_addr, dword ? 3 : 1);
+		const Bit32u slow_tlb = gen_ppc_tlb_read_lookup(reg_addr);
+		gen_ppc_direct_read_word(reg_dst, reg_addr, dword);
+		if (dynrec_stats.mem_enabled)
+			gen_add_direct_word(&dynrec_stats.mem_read_fast_hits, 1, true);
+		const Bit32u done = gen_ppc_branch_always();
+		gen_fill_branch_long(slow_unaligned);
+		gen_fill_branch_long(slow_tlb);
+		gen_mov_regs(FC_OP1,reg_addr);
+		if (dword) gen_call_function_raw((void *)&mem_readd_checked_drc);
+		else gen_call_function_raw((void *)&mem_readw_checked_drc);
+		dyn_check_exception(FC_RETOP);
+		gen_mov_word_to_reg(reg_dst,&core_dynrec.readdata,dword);
+		gen_fill_branch_long(done);
+		return;
+	}
+#endif
 	gen_mov_regs(FC_OP1,reg_addr);
 	if (dword) gen_call_function_raw((void *)&mem_readd_checked_drc);
 	else gen_call_function_raw((void *)&mem_readw_checked_drc);
@@ -797,6 +940,38 @@ static void dyn_read_word(HostReg reg_addr,HostReg reg_dst,bool dword) {
 // from reg_val into the memory given by the address
 static void dyn_write_word(HostReg reg_addr,HostReg reg_val,bool dword) {
 //	if (!dword) gen_extend_word(false,reg_val);
+#if defined(DRC_PPC_TLB_FAST_WRITE)
+	if (dynrec_stats.mem_write_fast_enabled) {
+		HostReg fast_addr=reg_addr;
+		HostReg fast_val=reg_val;
+		if (fast_addr==HOST_R8 || fast_addr==HOST_R9) {
+			gen_mov_regs(HOST_R11,fast_addr);
+			fast_addr=HOST_R11;
+		}
+		if (fast_val==HOST_R8 || fast_val==HOST_R9) {
+			gen_mov_regs(HOST_R12,fast_val);
+			fast_val=HOST_R12;
+		}
+		/* Byte-reversed indexed stores are used only for naturally aligned
+		 * values.  The checked helper retains x86 unaligned and page-crossing
+		 * semantics. */
+		const Bit32u slow_unaligned = gen_ppc_unaligned_branch(fast_addr, dword ? 3 : 1);
+		const Bit32u slow_tlb = gen_ppc_tlb_write_lookup(fast_addr);
+		gen_ppc_direct_write_word(fast_val,fast_addr,dword);
+		if (dynrec_stats.mem_enabled)
+			gen_add_direct_word(&dynrec_stats.mem_write_fast_hits, 1, true);
+		const Bit32u done = gen_ppc_branch_always();
+		gen_fill_branch_long(slow_unaligned);
+		gen_fill_branch_long(slow_tlb);
+		gen_mov_regs(FC_OP2,fast_val);
+		gen_mov_regs(FC_OP1,fast_addr);
+		if (dword) gen_call_function_raw((void *)&mem_writed_checked_drc);
+		else gen_call_function_raw((void *)&mem_writew_checked_drc);
+		dyn_check_exception(FC_RETOP);
+		gen_fill_branch_long(done);
+		return;
+	}
+#endif
 	gen_mov_regs(FC_OP2,reg_val);
 	gen_mov_regs(FC_OP1,reg_addr);
 	if (dword) gen_call_function_raw((void *)&mem_writed_checked_drc);
@@ -1212,14 +1387,33 @@ static struct {
 	Bitu ftype;
 } mf_functions[64];
 
+/* Translation-only state used to recognize an immediately adjacent full
+ * flags producer followed by JZ/JNZ. */
+static Bitu mf_instruction_id=0;
+static Bitu mf_direct_zf_instruction=0;
+static Bitu mf_direct_zf_type=t_UNKNOWN;
+
 static void InitFlagsOptimization(void) {
 	mf_functions_num=0;
+	mf_instruction_id=0;
+	mf_direct_zf_instruction=0;
+	mf_direct_zf_type=t_UNKNOWN;
+}
+
+static void BeginFlagsInstruction(void) {
+	mf_instruction_id++;
+}
+
+static void ClearDirectZFProducer(void) {
+	mf_direct_zf_instruction=0;
+	mf_direct_zf_type=t_UNKNOWN;
 }
 
 // replace all queued functions with their simpler variants
 // because the current instruction destroys all condition flags and
 // the flags are not required before
 static void InvalidateFlags(void) {
+	ClearDirectZFProducer();
 #ifdef DRC_FLAGS_INVALIDATION
 	for (Bitu ct=0; ct<mf_functions_num; ct++) {
 		gen_fill_function_ptr(mf_functions[ct].pos,mf_functions[ct].fct_ptr,mf_functions[ct].ftype);
@@ -1240,6 +1434,10 @@ static void InvalidateFlags(void* current_simple_function,Bitu flags_type) {
 	mf_functions[0].pos=cache.pos;
 	mf_functions[0].fct_ptr=current_simple_function;
 	mf_functions[0].ftype=flags_type;
+	mf_direct_zf_instruction=mf_instruction_id;
+	mf_direct_zf_type=flags_type;
+#else
+	ClearDirectZFProducer();
 #endif
 }
 
@@ -1247,6 +1445,7 @@ static void InvalidateFlags(void* current_simple_function,Bitu flags_type) {
 // destroys all condition flags and the flags weren't needed in-between
 // this function can be replaced by a simpler one as well
 static void InvalidateFlagsPartially(void* current_simple_function,Bitu flags_type) {
+	ClearDirectZFProducer();
 #ifdef DRC_FLAGS_INVALIDATION
 	mf_functions[mf_functions_num].pos=cache.pos;
 	mf_functions[mf_functions_num].fct_ptr=current_simple_function;
@@ -1259,6 +1458,7 @@ static void InvalidateFlagsPartially(void* current_simple_function,Bitu flags_ty
 // destroys all condition flags and the flags weren't needed in-between
 // this function can be replaced by a simpler one as well
 static void InvalidateFlagsPartially(void* current_simple_function,DRC_PTR_SIZE_IM cpos,Bitu flags_type) {
+	ClearDirectZFProducer();
 #ifdef DRC_FLAGS_INVALIDATION
 	mf_functions[mf_functions_num].pos=(Bit8u*)cpos;
 	mf_functions[mf_functions_num].fct_ptr=current_simple_function;
@@ -1269,7 +1469,64 @@ static void InvalidateFlagsPartially(void* current_simple_function,DRC_PTR_SIZE_
 
 // the current function needs the condition flags thus reset the queue
 static void AcquireFlags(Bitu flags_mask) {
+	ClearDirectZFProducer();
 #ifdef DRC_FLAGS_INVALIDATION
 	mf_functions_num=0;
+#endif
+}
+
+/* Optimize an immediately preceding CMP/TEST/AND/OR/XOR plus JZ/JNZ.
+ * The lazy-flags state is always preserved because x86 Jcc does not destroy
+ * flags and either successor may consume them.  PPC can additionally replace
+ * the full producer helper inside its not-yet-executed 16-byte call slot. */
+static bool TryDirectZFBranch(void) {
+#if defined(DRC_HAS_DIRECT_ZF_BRANCH) && defined(DRC_FLAGS_INVALIDATION)
+	if (mf_functions_num != 1 ||
+	    mf_direct_zf_instruction + 1 != mf_instruction_id ||
+	    mf_functions[0].ftype != mf_direct_zf_type)
+		return false;
+
+	switch (mf_direct_zf_type) {
+	case t_CMPb: case t_CMPw: case t_CMPd:
+	case t_TESTb: case t_TESTw: case t_TESTd:
+	case t_ANDb: case t_ANDw: case t_ANDd:
+	case t_ORb: case t_ORw: case t_ORd:
+	case t_XORb: case t_XORw: case t_XORd:
+		break;
+	default:
+		return false;
+	}
+
+
+	bool deferred_type=false;
+#if defined(DRC_HAS_INLINE_ZF_PRODUCER)
+	if (gen_fill_direct_zf_producer(mf_functions[0].pos,mf_direct_zf_type,deferred_type)) {
+		if (dynrec_stats.jit_enabled) dynrec_stats.zf_jcc_inline_producer++;
+		/* CMP used all four instructions for var1/var2/res.  No guest-visible
+		 * operation or fault can occur between the adjacent CMP and this Jcc. */
+		if (deferred_type) {
+			gen_mov_word_to_reg_imm(FC_RETOP,(Bit16u)mf_direct_zf_type);
+			gen_mov_word_from_reg(FC_RETOP,&lflags.type,true);
+		}
+	}
+#endif
+
+	switch (mf_direct_zf_type) {
+	case t_CMPb: case t_TESTb: case t_ANDb: case t_ORb: case t_XORb:
+		gen_mov_byte_to_reg_low(FC_RETOP,&lf_resb);
+		break;
+	case t_CMPw: case t_TESTw: case t_ANDw: case t_ORw: case t_XORw:
+		gen_mov_word_to_reg(FC_RETOP,&lf_resw,false);
+		break;
+	default:
+		gen_mov_word_to_reg(FC_RETOP,&lf_resd,true);
+		break;
+	}
+
+	mf_functions_num=0;
+	ClearDirectZFProducer();
+	return true;
+#else
+	return false;
 #endif
 }

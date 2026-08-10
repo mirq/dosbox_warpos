@@ -707,3 +707,193 @@ bool SERIAL_setCommParameters(COMPORT port,
 	return true;
 }
 #endif
+
+#ifdef __MORPHOS__
+
+#include <devices/serial.h>
+#include <exec/io.h>
+#include <exec/ports.h>
+#include <proto/exec.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct _COMPORT {
+    struct MsgPort *port;
+    struct IOExtSer *read_req;
+    struct IOExtSer *write_req;
+    struct IOExtSer original;
+    char input;
+    bool read_pending;
+    bool breakstatus;
+};
+
+static LONG morphos_serial_error = 0;
+
+static bool split_device_unit(const char *portname, char *device,
+                              size_t device_size, ULONG *unit)
+{
+    if (!portname || !*portname || !device || device_size < 2 || !unit)
+        return false;
+    const char *separator = strrchr(portname, '/');
+    if (!separator) separator = strrchr(portname, ':');
+    *unit = 0;
+    size_t length = strlen(portname);
+    if (separator && separator[1]) {
+        char *end = 0;
+        const unsigned long parsed = strtoul(separator + 1, &end, 10);
+        if (end && !*end) {
+            *unit = (ULONG)parsed;
+            length = (size_t)(separator - portname);
+        }
+    }
+    if (length >= device_size) return false;
+    memcpy(device, portname, length);
+    device[length] = 0;
+    return length != 0;
+}
+
+static void start_read(COMPORT port)
+{
+    if (!port || port->read_pending) return;
+    port->read_req->IOSer.io_Command = CMD_READ;
+    port->read_req->IOSer.io_Data = &port->input;
+    port->read_req->IOSer.io_Length = 1;
+    port->read_req->IOSer.io_Actual = 0;
+    SendIO((struct IORequest *)port->read_req);
+    port->read_pending = true;
+}
+
+bool SERIAL_open(const char *portname, COMPORT *port)
+{
+    if (!port) return false;
+    *port = 0;
+    char device[256];
+    ULONG unit = 0;
+    if (!split_device_unit(portname, device, sizeof(device), &unit)) {
+        morphos_serial_error = SerErr_InvParam;
+        return false;
+    }
+    COMPORT cp = (_COMPORT *)calloc(1, sizeof(_COMPORT));
+    if (!cp) return false;
+    cp->port = CreateMsgPort();
+    if (!cp->port) goto error;
+    cp->read_req = (struct IOExtSer *)CreateIORequest(cp->port, sizeof(struct IOExtSer));
+    cp->write_req = (struct IOExtSer *)CreateIORequest(cp->port, sizeof(struct IOExtSer));
+    if (!cp->read_req || !cp->write_req) goto error;
+    cp->read_req->io_SerFlags = SERF_SHARED | SERF_XDISABLED;
+    if (OpenDevice(device, unit, (struct IORequest *)cp->read_req, 0)) goto error;
+    memcpy(cp->write_req, cp->read_req, sizeof(struct IOExtSer));
+    cp->write_req->IOSer.io_Message.mn_ReplyPort = cp->port;
+    cp->original = *cp->read_req;
+    cp->breakstatus = false;
+    cp->read_pending = false;
+    start_read(cp);
+    *port = cp;
+    morphos_serial_error = 0;
+    return true;
+error:
+    morphos_serial_error = cp && cp->read_req ? cp->read_req->IOSer.io_Error : -1;
+    if (cp) {
+        if (cp->read_req && cp->read_req->IOSer.io_Device)
+            CloseDevice((struct IORequest *)cp->read_req);
+        if (cp->write_req) DeleteIORequest((struct IORequest *)cp->write_req);
+        if (cp->read_req) DeleteIORequest((struct IORequest *)cp->read_req);
+        if (cp->port) DeleteMsgPort(cp->port);
+        free(cp);
+    }
+    return false;
+}
+
+void SERIAL_close(COMPORT port)
+{
+    if (!port) return;
+    if (port->read_pending) {
+        AbortIO((struct IORequest *)port->read_req);
+        WaitIO((struct IORequest *)port->read_req);
+    }
+    if (port->read_req && port->read_req->IOSer.io_Device)
+        CloseDevice((struct IORequest *)port->read_req);
+    if (port->write_req) DeleteIORequest((struct IORequest *)port->write_req);
+    if (port->read_req) DeleteIORequest((struct IORequest *)port->read_req);
+    if (port->port) DeleteMsgPort(port->port);
+    free(port);
+}
+
+void SERIAL_getErrorString(char *buffer, size_t length)
+{
+    if (!buffer || !length) return;
+    snprintf(buffer, length, "serial.device error %ld", (long)morphos_serial_error);
+}
+
+bool SERIAL_sendchar(COMPORT port, char data)
+{
+    if (!port || port->breakstatus) return false;
+    port->write_req->IOSer.io_Command = CMD_WRITE;
+    port->write_req->IOSer.io_Data = &data;
+    port->write_req->IOSer.io_Length = 1;
+    DoIO((struct IORequest *)port->write_req);
+    return port->write_req->IOSer.io_Error == 0 && port->write_req->IOSer.io_Actual == 1;
+}
+
+int SERIAL_getextchar(COMPORT port)
+{
+    if (!port) return 0;
+    start_read(port);
+    if (!CheckIO((struct IORequest *)port->read_req)) return 0;
+    WaitIO((struct IORequest *)port->read_req);
+    port->read_pending = false;
+    int result = 0;
+    if (!port->read_req->IOSer.io_Error && port->read_req->IOSer.io_Actual) {
+        result = ((unsigned char)port->input) | 0x10000;
+        if (port->read_req->io_Status & IO_STATF_READBREAK) result |= SERIAL_BREAK_ERR;
+        if (port->read_req->io_Status & IO_STATF_OVERRUN) result |= SERIAL_OVERRUN_ERR;
+    }
+    start_read(port);
+    return result;
+}
+
+bool SERIAL_setCommParameters(COMPORT port, int baudrate, char parity,
+                              int stopbits, int length)
+{
+    if (!port || length < 5 || length > 8) return false;
+    struct IOExtSer *request = port->write_req;
+    request->io_Baud = (ULONG)baudrate;
+    request->io_ReadLen = (UBYTE)length;
+    request->io_WriteLen = (UBYTE)length;
+    request->io_StopBits = (UBYTE)(stopbits == SERIAL_2STOP ? 2 : 1);
+    request->io_SerFlags &= ~(SERF_PARTY_ON | SERF_PARTY_ODD);
+    if (parity != 'n') {
+        request->io_SerFlags |= SERF_PARTY_ON;
+        if (parity == 'o') request->io_SerFlags |= SERF_PARTY_ODD;
+    }
+    request->IOSer.io_Command = SDCMD_SETPARAMS;
+    DoIO((struct IORequest *)request);
+    return request->IOSer.io_Error == 0;
+}
+
+void SERIAL_setBREAK(COMPORT port, bool value)
+{
+    if (!port || port->breakstatus == value) return;
+    port->breakstatus = value;
+    port->write_req->IOSer.io_Command = SDCMD_BREAK;
+    port->write_req->IOSer.io_Length = value ? 1 : 0;
+    DoIO((struct IORequest *)port->write_req);
+}
+
+void SERIAL_setDTR(COMPORT, bool) {}
+void SERIAL_setRTS(COMPORT, bool) {}
+
+int SERIAL_getmodemstatus(COMPORT port)
+{
+    if (!port) return 0;
+    port->write_req->IOSer.io_Command = SDCMD_QUERY;
+    DoIO((struct IORequest *)port->write_req);
+    /* serial.device does not expose a portable CTS/DSR mapping in IOExtSer;
+       report both asserted so DOS software can transmit on three-wire links. */
+    return SERIAL_CTS | SERIAL_DSR;
+}
+
+bool SERIAL_setmodemcontrol(COMPORT, int) { return true; }
+
+#endif

@@ -32,6 +32,7 @@
 #include "int10.h"
 #include "bios.h"
 #include "dos_inc.h"
+#include "setup.h"
 
 static Bitu call_int33,call_int74,int74_ret_callback,call_mouse_bd;
 static Bit16u ps2cbseg,ps2cbofs;
@@ -41,6 +42,7 @@ static RealPt ps2_callback,uir_callback;
 static Bit16s oldmouseX, oldmouseY;
 // forward
 void WriteMouseIntVector(void);
+void MOUSE_Limit_Events(Bitu val);
 
 struct button_event {
 	Bit8u type;
@@ -128,39 +130,514 @@ static struct {
 	Bit16s gran_x,gran_y;
 } mouse;
 
-bool Mouse_SetPS2State(bool use) {
-	if (use && (!ps2callbackinit)) {
-		useps2callback = false;
-		PIC_SetIRQMask(MOUSE_IRQ,true);
-		return false;
+/* State maintained by the INT 15h/C2h pointing-device BIOS interface.
+ * Keep it independent from the DOS INT 33h mouse state: Windows 3.x/9x
+ * installs a BIOS PS/2 callback and expects reset, sampling, resolution and
+ * scaling commands to have persistent, queryable semantics. */
+struct PS2BiosState {
+	bool initialized;
+	Bit8u packet_size;
+	Bit8u sample_rate_code;
+	Bit8u resolution;
+	Bit8u device_id;
+	Bit8u unlock_index;
+	bool scaling_21;
+};
+
+static PS2BiosState ps2_bios;
+static const Bit8u ps2_sample_rates[7] = { 10, 20, 40, 60, 80, 100, 200 };
+
+/* DOSBox-X integration I/O device (default ports 28h-2Bh).
+ * Both the Windows 3.1 and Windows 95 DOSBox-X pointer drivers use this
+ * interface.  Their normal BIOS PS/2 callback remains the notification and
+ * button channel; this device supplies the host pointer's absolute position. */
+enum MouseIntegrationMode {
+	MOUSE_INTEGRATION_NONE = 0,
+	MOUSE_INTEGRATION_WIN31,
+	MOUSE_INTEGRATION_WIN95
+};
+
+enum MouseIntegrationPointerMode {
+	MOUSE_POINTER_WINDOWS_ONLY = 0,
+	MOUSE_POINTER_BOTH,
+	MOUSE_POINTER_MORPHOS_ONLY
+};
+
+static const Bitu DOSBOX_ID_BASE = 0x28;
+static const Bit32u DOSBOX_ID_RESET_DATA_CODE = 0x0d05b0c5UL;
+static const Bit32u DOSBOX_ID_RESET_INDEX_CODE = 0xaa55bb66UL;
+static const Bit32u DOSBOX_ID_IDENTIFICATION = 0xd05b0740UL;
+static const Bit32u DOSBOX_ID_REG_IDENTIFY = 0x00000000UL;
+static const Bit32u DOSBOX_ID_REG_VERSION_NUMBER = 0x00000003UL;
+static const Bit32u DOSBOX_ID_REG_USER_MOUSE_STATUS = 0x00434d54UL;
+static const Bit32u DOSBOX_ID_REG_USER_MOUSE_CURSOR = 0x00434d55UL;
+static const Bit32u DOSBOX_ID_REG_USER_MOUSE_CURSOR_NORMALIZED = 0x00434d56UL;
+static const Bit32u DOSBOX_ID_REG_RELEASE_MOUSE_CAPTURE = 0x0052434dUL;
+static const Bit32u DOSBOX_ID_REG_GET_WINDOW_SIZE = 0x006845ffUL;
+
+enum DosboxIdCommand {
+	DOSBOX_ID_CMD_RESET_LATCH = 0x00,
+	DOSBOX_ID_CMD_FLUSH_WRITE = 0x01,
+	DOSBOX_ID_CMD_PUSH_STATE = 0x20,
+	DOSBOX_ID_CMD_POP_STATE = 0x21,
+	DOSBOX_ID_CMD_DISCARD_STATE = 0x22,
+	DOSBOX_ID_CMD_DISCARD_ALL_STATE = 0x23,
+	DOSBOX_ID_CMD_CLEAR_ERROR = 0xfe,
+	DOSBOX_ID_CMD_RESET_INTERFACE = 0xff
+};
+
+struct DosboxIdSavedState {
+	Bit32u reg_select;
+	Bit32u data_latch;
+	Bit8u reg_byte;
+	Bit8u data_byte;
+	bool error;
+	bool reset_signature;
+};
+
+static struct {
+	MouseIntegrationMode mode;
+	MouseIntegrationPointerMode pointer_mode;
+	bool guest_active;
+	bool locked;
+	Bit16u host_x;
+	Bit16u host_y;
+	Bit16u host_width;
+	Bit16u host_height;
+	Bit16u normalized_x;
+	Bit16u normalized_y;
+
+	Bit32u reg_select;
+	Bit32u data_latch;
+	Bit8u reg_byte;
+	Bit8u data_byte;
+	bool error;
+	bool reset_signature;
+
+	DosboxIdSavedState saved[8];
+	Bit8u saved_count;
+} mouse_integration;
+
+static void Mouse_IntegrationNotifyFrontend(void)
+{
+#if defined(__MORPHOS__)
+	Mouse_IntegrationStateChanged();
+#endif
+}
+
+static void DOSBOX_ID_ResetLatch(void)
+{
+	mouse_integration.reg_byte = 0;
+	mouse_integration.data_byte = 0;
+}
+
+static void DOSBOX_ID_ResetInterface(void)
+{
+	mouse_integration.reg_select = DOSBOX_ID_RESET_INDEX_CODE;
+	mouse_integration.data_latch = DOSBOX_ID_RESET_DATA_CODE;
+	mouse_integration.reg_byte = 0;
+	mouse_integration.data_byte = 0;
+	mouse_integration.error = false;
+	mouse_integration.reset_signature = true;
+	mouse_integration.saved_count = 0;
+}
+
+static Bit32u DOSBOX_ID_ReadRegister(Bit32u reg)
+{
+	switch (reg) {
+	case DOSBOX_ID_REG_IDENTIFY:
+		return DOSBOX_ID_IDENTIFICATION;
+	case DOSBOX_ID_REG_VERSION_NUMBER:
+		return 0x00010000UL;
+	case DOSBOX_ID_REG_USER_MOUSE_STATUS:
+		/* Bit 0 is the capture lock checked by the DOSBox-X pointer driver;
+		 * bit 1 mirrors actual host capture as in DOSBox-X.  MorphOS uses one
+		 * state for both, so report both bits together. */
+		return mouse_integration.locked ? 3UL : 0UL;
+	case DOSBOX_ID_REG_USER_MOUSE_CURSOR:
+		return ((Bit32u)mouse_integration.host_y << 16) |
+		       mouse_integration.host_x;
+	case DOSBOX_ID_REG_USER_MOUSE_CURSOR_NORMALIZED:
+		return ((Bit32u)mouse_integration.normalized_y << 16) |
+		       mouse_integration.normalized_x;
+	case DOSBOX_ID_REG_RELEASE_MOUSE_CAPTURE:
+		return mouse_integration.locked ? 1UL : 0UL;
+	case DOSBOX_ID_REG_GET_WINDOW_SIZE:
+		return ((Bit32u)mouse_integration.host_height << 16) |
+		       mouse_integration.host_width;
+	default:
+		return 0;
 	}
-	useps2callback = use;
-	Mouse_AutoLock(useps2callback);
-	PIC_SetIRQMask(MOUSE_IRQ,!useps2callback);
+}
+
+static void DOSBOX_ID_WriteRegister(Bit32u reg, Bit32u value)
+{
+	switch (reg) {
+	case DOSBOX_ID_REG_USER_MOUSE_CURSOR_NORMALIZED: {
+		/* The DOSBox-X drivers write one after installing their BIOS PS/2
+		 * callback and zero while shutting it down.  Force the MorphOS
+		 * frontend to reevaluate capture/cursor visibility immediately. */
+		const bool active = value != 0;
+		if (mouse_integration.guest_active != active) {
+			mouse_integration.guest_active = active;
+			Mouse_IntegrationNotifyFrontend();
+		}
+		break;
+	}
+	case DOSBOX_ID_REG_RELEASE_MOUSE_CAPTURE:
+		/* The MorphOS frontend owns capture state.  Reading this register is
+		 * supported; a write is intentionally harmless rather than changing
+		 * Intuition state from inside an emulated I/O instruction. */
+		break;
+	default:
+		break;
+	}
+}
+
+static Bitu DOSBOX_ID_Read(Bitu port, Bitu iolen)
+{
+	const Bitu offset = port - DOSBOX_ID_BASE;
+	if (iolen != 1 && iolen != 2 && iolen != 4) return ~((Bitu)0);
+
+	if (offset == 2) {
+		return (mouse_integration.error ? 0x02 : 0) |
+		       ((mouse_integration.data_byte & 3) << 4) |
+		       ((mouse_integration.reg_byte & 3) << 6);
+	}
+	if (offset > 1) return ~((Bitu)0);
+
+	Bitu result = 0;
+	for (Bitu byte = 0; byte < iolen; ++byte) {
+		if (offset == 0) {
+			result |= (Bitu)((mouse_integration.reg_select >>
+			                   (mouse_integration.reg_byte * 8)) & 0xffUL) <<
+			          (byte * 8);
+			mouse_integration.reg_byte =
+				(Bit8u)((mouse_integration.reg_byte + 1) & 3);
+		} else {
+			if (mouse_integration.data_byte == 0) {
+				mouse_integration.data_latch = mouse_integration.reset_signature ?
+					DOSBOX_ID_RESET_DATA_CODE :
+					DOSBOX_ID_ReadRegister(mouse_integration.reg_select);
+			}
+			result |= (Bitu)((mouse_integration.data_latch >>
+			                   (mouse_integration.data_byte * 8)) & 0xffUL) <<
+			          (byte * 8);
+			mouse_integration.data_byte =
+				(Bit8u)((mouse_integration.data_byte + 1) & 3);
+		}
+	}
+	return result;
+}
+
+static void DOSBOX_ID_PushState(void)
+{
+	if (mouse_integration.saved_count >= 8) {
+		mouse_integration.error = true;
+		return;
+	}
+	DosboxIdSavedState &saved =
+		mouse_integration.saved[mouse_integration.saved_count++];
+	saved.reg_select = mouse_integration.reg_select;
+	saved.data_latch = mouse_integration.data_latch;
+	saved.reg_byte = mouse_integration.reg_byte;
+	saved.data_byte = mouse_integration.data_byte;
+	saved.error = mouse_integration.error;
+	saved.reset_signature = mouse_integration.reset_signature;
+}
+
+static void DOSBOX_ID_PopState(bool restore)
+{
+	if (!mouse_integration.saved_count) {
+		mouse_integration.error = true;
+		return;
+	}
+	const DosboxIdSavedState saved =
+		mouse_integration.saved[--mouse_integration.saved_count];
+	if (!restore) return;
+	mouse_integration.reg_select = saved.reg_select;
+	mouse_integration.data_latch = saved.data_latch;
+	mouse_integration.reg_byte = saved.reg_byte;
+	mouse_integration.data_byte = saved.data_byte;
+	mouse_integration.error = saved.error;
+	mouse_integration.reset_signature = saved.reset_signature;
+}
+
+static void DOSBOX_ID_Command(Bit8u command)
+{
+	switch (command) {
+	case DOSBOX_ID_CMD_RESET_LATCH:
+		DOSBOX_ID_ResetLatch();
+		break;
+	case DOSBOX_ID_CMD_FLUSH_WRITE:
+		if (mouse_integration.data_byte) {
+			DOSBOX_ID_WriteRegister(mouse_integration.reg_select,
+			                        mouse_integration.data_latch);
+			mouse_integration.data_byte = 0;
+		}
+		break;
+	case DOSBOX_ID_CMD_PUSH_STATE: {
+		const bool can_push = mouse_integration.saved_count < 8;
+		DOSBOX_ID_PushState();
+		if (can_push) {
+			mouse_integration.error = false;
+			mouse_integration.reg_select = DOSBOX_ID_RESET_INDEX_CODE;
+			mouse_integration.data_latch = DOSBOX_ID_RESET_DATA_CODE;
+			mouse_integration.reg_byte = 0;
+			mouse_integration.data_byte = 0;
+			mouse_integration.reset_signature = true;
+		}
+		break;
+	}
+	case DOSBOX_ID_CMD_POP_STATE:
+		DOSBOX_ID_PopState(true);
+		break;
+	case DOSBOX_ID_CMD_DISCARD_STATE:
+		DOSBOX_ID_PopState(false);
+		break;
+	case DOSBOX_ID_CMD_DISCARD_ALL_STATE:
+		mouse_integration.saved_count = 0;
+		break;
+	case DOSBOX_ID_CMD_CLEAR_ERROR:
+		mouse_integration.error = false;
+		break;
+	case DOSBOX_ID_CMD_RESET_INTERFACE:
+		DOSBOX_ID_ResetInterface();
+		break;
+	default:
+		mouse_integration.error = true;
+		break;
+	}
+}
+
+static void DOSBOX_ID_Write(Bitu port, Bitu value, Bitu iolen)
+{
+	const Bitu offset = port - DOSBOX_ID_BASE;
+	if (iolen != 1 && iolen != 2 && iolen != 4) return;
+	if (offset == 2) {
+		DOSBOX_ID_Command((Bit8u)value);
+		return;
+	}
+	if (offset > 1) return;
+
+	for (Bitu byte = 0; byte < iolen; ++byte) {
+		const Bit32u input = ((Bit32u)value >> (byte * 8)) & 0xffUL;
+		if (offset == 0) {
+			const Bitu shift = mouse_integration.reg_byte * 8;
+			mouse_integration.reg_select =
+				(mouse_integration.reg_select & ~(0xffUL << shift)) |
+				(input << shift);
+			mouse_integration.reg_byte =
+				(Bit8u)((mouse_integration.reg_byte + 1) & 3);
+			if (mouse_integration.reg_byte == 0)
+				mouse_integration.reset_signature = false;
+		} else {
+			const Bitu shift = mouse_integration.data_byte * 8;
+			mouse_integration.data_latch =
+				(mouse_integration.data_latch & ~(0xffUL << shift)) |
+				(input << shift);
+			mouse_integration.data_byte =
+				(Bit8u)((mouse_integration.data_byte + 1) & 3);
+			if (mouse_integration.data_byte == 0)
+				DOSBOX_ID_WriteRegister(mouse_integration.reg_select,
+				                        mouse_integration.data_latch);
+		}
+	}
+}
+
+bool Mouse_IntegrationConfigured(void)
+{
+	return mouse_integration.mode != MOUSE_INTEGRATION_NONE;
+}
+
+bool Mouse_IntegrationGuestActive(void)
+{
+	/* The guest-side register only requests integration.  Do not hide the
+	 * MorphOS cursor or inject notification IRQs until the BIOS callback is
+	 * installed and enabled as well.  This prevents the short C207h/C200h
+	 * initialization window from being treated as an active driver. */
+	return Mouse_IntegrationConfigured() && mouse_integration.guest_active &&
+	       ps2callbackinit && useps2callback;
+}
+
+bool Mouse_IntegrationShowHostCursor(void)
+{
+	return mouse_integration.pointer_mode != MOUSE_POINTER_WINDOWS_ONLY;
+}
+
+bool Mouse_IntegrationShowGuestCursor(void)
+{
+	/* A manually captured pointer is invisible on the host.  Fall back to the
+	 * guest cursor in that state so MorphOS-only mode can never leave the user
+	 * without any visible pointer. */
+	return mouse_integration.pointer_mode != MOUSE_POINTER_MORPHOS_ONLY ||
+	       mouse_integration.locked;
+}
+
+void Mouse_IntegrationSetLocked(bool locked)
+{
+	mouse_integration.locked = locked;
+}
+
+static void Mouse_PS2ClearPendingEvents(void)
+{
+	PIC_RemoveEvents(MOUSE_Limit_Events);
+	PIC_DeActivateIRQ(MOUSE_IRQ);
+	mouse.timer_in_progress = false;
+	mouse.in_UIR = false;
+	mouse.events = 0;
+	memset(mouse.event_queue,0,sizeof(mouse.event_queue));
+	oldmouseX = static_cast<Bit16s>(mouse.x);
+	oldmouseY = static_cast<Bit16s>(mouse.y);
+}
+
+static void Mouse_PS2ApplyDefaults(bool preserve_packet_size)
+{
+	const Bit8u packet_size = preserve_packet_size && ps2_bios.packet_size ?
+	                         ps2_bios.packet_size : 3;
+	ps2_bios.initialized = true;
+	ps2_bios.packet_size = packet_size;
+	ps2_bios.sample_rate_code = 5; /* 100 reports/second */
+	ps2_bios.resolution = 2;       /* 4 counts/mm */
+	ps2_bios.device_id = 0;        /* standard PS/2 pointing device */
+	ps2_bios.unlock_index = 0;
+	ps2_bios.scaling_21 = false;
+}
+
+bool Mouse_PS2CallbackInstalled(void)
+{
+	/* ES:BX=0000:0000 removes the callback.  Either component may legally
+	 * be zero on its own, so do not reject a valid paragraph boundary. */
+	return ps2callbackinit && (ps2cbseg != 0 || ps2cbofs != 0);
+}
+
+void Mouse_PS2Reset(void)
+{
+	/* IBM's C201h reset preserves the selected data package size but resets
+	 * all other device characteristics and leaves the device disabled. */
+	useps2callback = false;
+	PIC_SetIRQMask(MOUSE_IRQ,true);
+	Mouse_PS2ClearPendingEvents();
+	Mouse_PS2ApplyDefaults(true);
+	if (Mouse_IntegrationConfigured()) Mouse_IntegrationNotifyFrontend();
+	else Mouse_AutoLock(false);
+}
+
+bool Mouse_PS2Initialize(Bit8u packet_size)
+{
+	/* DOSBox-X supports the standard three-byte packet and a four-byte
+	 * IntelliMouse packet.  The Win3.1/Win95 integration drivers request 3. */
+	if (packet_size != 3 && !(packet_size == 4 && ps2_bios.device_id == 3))
+		return false;
+
+	useps2callback = false;
+	PIC_SetIRQMask(MOUSE_IRQ,true);
+	Mouse_PS2ClearPendingEvents();
+	Mouse_PS2ApplyDefaults(false);
+	ps2_bios.packet_size = packet_size;
+	if (Mouse_IntegrationConfigured()) Mouse_IntegrationNotifyFrontend();
+	else Mouse_AutoLock(false);
+	return true;
+}
+
+bool Mouse_PS2SetSamplingRate(Bit8u rate_code)
+{
+	if (rate_code >= 7) return false;
+	ps2_bios.sample_rate_code = rate_code;
+
+	/* Standard IntelliMouse unlock sequence: 200, 100, 80 reports/s. */
+	static const Bit8u unlock_sequence[3] = { 6, 5, 4 };
+	if (rate_code == unlock_sequence[ps2_bios.unlock_index]) {
+		if (++ps2_bios.unlock_index == 3) {
+			ps2_bios.device_id = 3;
+			ps2_bios.unlock_index = 0;
+		}
+	} else {
+		ps2_bios.unlock_index = (rate_code == unlock_sequence[0]) ? 1 : 0;
+	}
+	return true;
+}
+
+bool Mouse_PS2SetResolution(Bit8u resolution)
+{
+	if (resolution > 3) return false;
+	ps2_bios.resolution = resolution;
+	return true;
+}
+
+void Mouse_PS2SetScaling(bool scaling_21)
+{
+	ps2_bios.scaling_21 = scaling_21;
+}
+
+Bit8u Mouse_PS2GetType(void)
+{
+	return ps2_bios.device_id;
+}
+
+void Mouse_PS2GetStatus(Bit8u &status, Bit8u &resolution, Bit8u &sample_rate)
+{
+	/* IBM status layout: bit 0 right, bit 2 left, bit 4 2:1 scaling,
+	 * bit 5 enabled, bit 6 remote mode (we always operate in stream mode). */
+	status = 0;
+	if (mouse.buttons & 0x02) status |= 0x01;
+	if (mouse.buttons & 0x01) status |= 0x04;
+	if (ps2_bios.scaling_21) status |= 0x10;
+	if (useps2callback) status |= 0x20;
+	resolution = ps2_bios.resolution;
+	sample_rate = ps2_sample_rates[ps2_bios.sample_rate_code];
+}
+
+bool Mouse_SetPS2State(bool use) {
+	if (use) {
+		if (!Mouse_PS2CallbackInstalled()) {
+			useps2callback = false;
+			PIC_SetIRQMask(MOUSE_IRQ,true);
+			return false;
+		}
+		if (!ps2_bios.initialized) Mouse_PS2ApplyDefaults(false);
+		Mouse_PS2ClearPendingEvents();
+		useps2callback = true;
+		PIC_SetIRQMask(MOUSE_IRQ,false);
+		/* Absolute integration must never request MorphOS pointer capture. */
+		if (Mouse_IntegrationConfigured()) Mouse_IntegrationNotifyFrontend();
+		else Mouse_AutoLock(true);
+	} else {
+		useps2callback = false;
+		Mouse_PS2ClearPendingEvents();
+		PIC_SetIRQMask(MOUSE_IRQ,true);
+		if (Mouse_IntegrationConfigured()) Mouse_IntegrationNotifyFrontend();
+		else Mouse_AutoLock(false);
+	}
 	return true;
 }
 
 void Mouse_ChangePS2Callback(Bit16u pseg, Bit16u pofs) {
 	if ((pseg==0) && (pofs==0)) {
+		Mouse_SetPS2State(false);
 		ps2callbackinit = false;
-		Mouse_AutoLock(false);
+		ps2cbseg = 0;
+		ps2cbofs = 0;
 	} else {
 		ps2callbackinit = true;
 		ps2cbseg = pseg;
 		ps2cbofs = pofs;
+		oldmouseX = static_cast<Bit16s>(mouse.x);
+		oldmouseY = static_cast<Bit16s>(mouse.y);
 	}
-	Mouse_AutoLock(ps2callbackinit);
+	if (Mouse_IntegrationConfigured()) Mouse_IntegrationNotifyFrontend();
+	else Mouse_AutoLock(ps2callbackinit);
 }
 
 void DoPS2Callback(Bit16u data, Bit16s mouseX, Bit16s mouseY) {
-	if (useps2callback) {
+	if (useps2callback && Mouse_PS2CallbackInstalled()) {
 		Bit16u mdat = (data & 0x03) | 0x08;
 		Bit16s xdiff = mouseX-oldmouseX;
 		Bit16s ydiff = oldmouseY-mouseY;
 		oldmouseX = mouseX;
 		oldmouseY = mouseY;
-		if ((xdiff>0xff) || (xdiff<-0xff)) mdat |= 0x40;		// x overflow
-		if ((ydiff>0xff) || (ydiff<-0xff)) mdat |= 0x80;		// y overflow
+		if ((xdiff>0xff) || (xdiff<-0xff)) mdat |= 0x40;
+		if ((ydiff>0xff) || (ydiff<-0xff)) mdat |= 0x80;
 		xdiff %= 256;
 		ydiff %= 256;
 		if (xdiff<0) {
@@ -171,10 +648,12 @@ void DoPS2Callback(Bit16u data, Bit16s mouseX, Bit16s mouseY) {
 			ydiff = (0x100+ydiff);
 			mdat |= 0x20;
 		}
-		CPU_Push16((Bit16u)mdat); 
-		CPU_Push16((Bit16u)(xdiff % 256)); 
-		CPU_Push16((Bit16u)(ydiff % 256)); 
-		CPU_Push16((Bit16u)0); 
+		CPU_Push16((Bit16u)mdat);
+		CPU_Push16((Bit16u)(xdiff % 256));
+		CPU_Push16((Bit16u)(ydiff % 256));
+		/* The BIOS callback ABI always supplies a fourth data word.  Standard
+		 * devices report zero; this also gives the Win9x driver a stable value. */
+		CPU_Push16((Bit16u)0);
 		CPU_Push16(RealSeg(ps2_callback));
 		CPU_Push16(RealOff(ps2_callback));
 		SegSet16(cs, ps2cbseg);
@@ -183,7 +662,7 @@ void DoPS2Callback(Bit16u data, Bit16s mouseX, Bit16s mouseY) {
 }
 
 Bitu PS2_Handler(void) {
-	CPU_Pop16();CPU_Pop16();CPU_Pop16();CPU_Pop16();// remove the 4 words
+	CPU_Pop16();CPU_Pop16();CPU_Pop16();CPU_Pop16();
 	return CBRET_NONE;
 }
 
@@ -229,6 +708,40 @@ INLINE void Mouse_AddEvent(Bit8u type) {
 		PIC_AddEvent(MOUSE_Limit_Events,MOUSE_DELAY);
 		PIC_ActivateIRQ(MOUSE_IRQ);
 	}
+}
+
+void Mouse_IntegrationHostPosition(Bit16u x, Bit16u y,
+                                   Bit16u width, Bit16u height)
+{
+	if (!Mouse_IntegrationConfigured()) return;
+
+	if (!width) width = 1;
+	if (!height) height = 1;
+	if (x >= width) x = width - 1;
+	if (y >= height) y = height - 1;
+
+	Bit32u normalized_x32 = width > 1 ?
+		((Bit32u)x << 16) / (width - 1) : 0;
+	Bit32u normalized_y32 = height > 1 ?
+		((Bit32u)y << 16) / (height - 1) : 0;
+	if (normalized_x32 > 0xffffUL) normalized_x32 = 0xffffUL;
+	if (normalized_y32 > 0xffffUL) normalized_y32 = 0xffffUL;
+	const Bit16u normalized_x = (Bit16u)normalized_x32;
+	const Bit16u normalized_y = (Bit16u)normalized_y32;
+	const bool changed = normalized_x != mouse_integration.normalized_x ||
+	                     normalized_y != mouse_integration.normalized_y;
+
+	mouse_integration.host_x = x;
+	mouse_integration.host_y = y;
+	mouse_integration.host_width = width;
+	mouse_integration.host_height = height;
+	mouse_integration.normalized_x = normalized_x;
+	mouse_integration.normalized_y = normalized_y;
+
+	/* The DOSBox-X driver reads the absolute coordinates from the I/O device,
+	 * but it deliberately uses the normal BIOS PS/2 callback as notification. */
+	if (changed && Mouse_IntegrationGuestActive() && !mouse_integration.locked)
+		Mouse_AddEvent(MOUSE_HAS_MOVED);
 }
 
 // ***************************************************************************
@@ -471,7 +984,12 @@ void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
 
 	if((fabs(xrel) > 1.0) || (mouse.senv_x < 1.0)) dx *= mouse.senv_x;
 	if((fabs(yrel) > 1.0) || (mouse.senv_y < 1.0)) dy *= mouse.senv_y;
-	if (useps2callback) dy *= 2;	
+#if !defined(__MORPHOS__)
+	/* Legacy DOSBox behaviour doubles PS/2 Y movement.  MorphOS already
+	 * supplies host-processed deltas, and Windows 95 applies its own PS/2
+	 * acceleration, so doubling here makes the guest cursor outrun the host. */
+	if (useps2callback) dy *= 2;
+#endif
 
 	mouse.mickey_x += (dx * mouse.mickeysPerPixel_x);
 	mouse.mickey_y += (dy * mouse.mickeysPerPixel_y);
@@ -1111,7 +1629,36 @@ Bitu UIR_Handler(void) {
 	return CBRET_NONE;
 }
 
-void MOUSE_Init(Section* /*sec*/) {
+void MOUSE_Init(Section* sec) {
+	memset(&ps2_bios,0,sizeof(ps2_bios));
+	Mouse_PS2ApplyDefaults(false);
+	useps2callback = false;
+	ps2callbackinit = false;
+	ps2cbseg = ps2cbofs = 0;
+	memset(&mouse_integration,0,sizeof(mouse_integration));
+	mouse_integration.mode = MOUSE_INTEGRATION_NONE;
+	mouse_integration.pointer_mode = MOUSE_POINTER_WINDOWS_ONLY;
+	if (sec) {
+		Section_prop *section = static_cast<Section_prop *>(sec);
+		const char *mode = section->Get_string("mode");
+		if (mode && !strcmp(mode,"win31"))
+			mouse_integration.mode = MOUSE_INTEGRATION_WIN31;
+		else if (mode && !strcmp(mode,"win95"))
+			mouse_integration.mode = MOUSE_INTEGRATION_WIN95;
+		const char *pointer = section->Get_string("pointer");
+		if (pointer && !strcmp(pointer,"both"))
+			mouse_integration.pointer_mode = MOUSE_POINTER_BOTH;
+		else if (pointer && !strcmp(pointer,"morphos_only"))
+			mouse_integration.pointer_mode = MOUSE_POINTER_MORPHOS_ONLY;
+	}
+	DOSBOX_ID_ResetInterface();
+	if (Mouse_IntegrationConfigured()) {
+		IO_RegisterReadHandler(DOSBOX_ID_BASE,DOSBOX_ID_Read,IO_MA,4);
+		IO_RegisterWriteHandler(DOSBOX_ID_BASE,DOSBOX_ID_Write,IO_MA,4);
+		LOG(LOG_MOUSE,LOG_NORMAL)("DOSBox-X mouse integration device enabled for %s",
+			mouse_integration.mode == MOUSE_INTEGRATION_WIN31 ? "Windows 3.1" : "Windows 95");
+	}
+
 	// Callback for mouse interrupt 0x33
 	call_int33=CALLBACK_Allocate();
 //	RealPt i33loc=RealMake(CB_SEG+1,(call_int33*CB_SIZE)-0x10);

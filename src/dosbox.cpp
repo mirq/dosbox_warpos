@@ -42,6 +42,11 @@
 #include "ints/int10.h"
 #include "render.h"
 #include "pci_bus.h"
+#include "ne2000.h"
+#include "voodoo.h"
+#ifdef __MORPHOS__
+#include "morphos_platform.h"
+#endif
 
 Config * control;
 MachineType machine;
@@ -120,7 +125,7 @@ void INT10_Init(Section*);
 
 static LoopHandler * loop;
 
-bool SDLNetInited;
+bool NetworkInited;
 
 static Bit32u ticksRemain;
 static Bit32u ticksLast;
@@ -129,6 +134,68 @@ Bit32s ticksDone;
 Bit32u ticksScheduled;
 bool ticksLocked;
 void increaseticks();
+
+#ifdef __MORPHOS__
+/*
+ * The original max-cycles controller measures host load in whole milliseconds
+ * and subtracts a whole-millisecond sleep result.  On fast PowerPC hosts this
+ * quantisation can make the same executable settle at very different cycle
+ * counts.  Keep DOS/PIC scheduling at 1 ms, but measure only the auto-cycles
+ * controller with the monotonic EClock microsecond source.
+ */
+static bool morphos_highres_max_cycles = true;
+static bool morphos_cycle_stats = false;
+static Bit64u morphos_auto_busy_us = 0;
+static Bit64u morphos_auto_scheduled_us = 0;
+static Bit64u morphos_auto_last_us = 0;
+static Bit64u morphos_cycle_sum = 0;
+static Bit32u morphos_cycle_updates = 0;
+static Bit32u morphos_cycle_min = 0xffffffffu;
+static Bit32u morphos_cycle_max = 0;
+
+void DOSBOX_SetHighResolutionMaxCycles(bool enabled)
+{
+    morphos_highres_max_cycles = enabled;
+}
+
+void DOSBOX_SetCycleStats(bool enabled)
+{
+    morphos_cycle_stats = enabled;
+}
+
+void DOSBOX_ResetAutoCycleController(void)
+{
+    morphos_auto_busy_us = 0;
+    morphos_auto_scheduled_us = 0;
+    morphos_auto_last_us = MORPHOS_GetMicroseconds();
+}
+
+void DOSBOX_DumpCycleStats(void)
+{
+    if (!morphos_cycle_stats) return;
+    if (!morphos_cycle_updates) {
+        LOG_MSG("MorphOS max-cycles statistics: no controller updates");
+        return;
+    }
+    LOG_MSG("MorphOS max-cycles statistics (%s clock): updates=%lu, min=%lu, max=%lu, average=%llu, final=%ld",
+            morphos_highres_max_cycles ? "EClock microsecond" : "legacy millisecond",
+            (unsigned long)morphos_cycle_updates,
+            (unsigned long)morphos_cycle_min,
+            (unsigned long)morphos_cycle_max,
+            (unsigned long long)(morphos_cycle_sum / morphos_cycle_updates),
+            (long)CPU_CycleMax);
+}
+
+static void MorphOS_RecordCycleValue(Bit32s value)
+{
+    if (!morphos_cycle_stats || value <= 0) return;
+    const Bit32u current = (Bit32u)value;
+    if (current < morphos_cycle_min) morphos_cycle_min = current;
+    if (current > morphos_cycle_max) morphos_cycle_max = current;
+    morphos_cycle_sum += current;
+    morphos_cycle_updates++;
+}
+#endif
 
 static Bitu Normal_Loop(void) {
 	Bits ret;
@@ -155,9 +222,28 @@ static Bitu Normal_Loop(void) {
 }
 
 //For trying other delays
+#ifdef __MORPHOS__
+#define wrap_delay(a) MORPHOS_Delay(a)
+#else
 #define wrap_delay(a) SDL_Delay(a)
+#endif
 
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
+#ifdef __MORPHOS__
+	const bool morphos_use_highres_cycles = morphos_highres_max_cycles &&
+	                                         CPU_CycleAutoAdjust &&
+	                                         !CPU_SkipCycleAutoAdjust;
+	/* Account only time spent running DOSBox work.  Time spent in the explicit
+	 * idle sleep is removed below by advancing morphos_auto_last_us after sleep. */
+	if (morphos_use_highres_cycles) {
+		const Bit64u now_us = MORPHOS_GetMicroseconds();
+		if (morphos_auto_last_us && now_us >= morphos_auto_last_us)
+			morphos_auto_busy_us += now_us - morphos_auto_last_us;
+		morphos_auto_last_us = now_us;
+		morphos_auto_scheduled_us += Bit64u(ticksAdded) * 1000ULL;
+	}
+#endif
+
 	if (GCC_UNLIKELY(ticksLocked)) { // For Fast Forward Mode
 		ticksRemain=5;
 		/* Reset any auto cycle guessing for this frame */
@@ -165,6 +251,9 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 		ticksAdded = 0;
 		ticksDone = 0;
 		ticksScheduled = 0;
+#ifdef __MORPHOS__
+		DOSBOX_ResetAutoCycleController();
+#endif
 		return;
 	}
 	
@@ -177,6 +266,14 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 	if (ticksNew <= ticksLast) { //lower should not be possible, only equal.
 		ticksAdded = 0;
 
+#ifdef __MORPHOS__
+		if (morphos_use_highres_cycles) {
+			/* The old 2/3/4 ms sleep pattern exists solely to decorrelate a
+			 * millisecond-resolution controller.  It adds run-to-run variance on
+			 * G5, so the high-resolution controller always requests one tick. */
+			wrap_delay(1);
+		} else
+#endif
 		if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust || sleep1count < 3) {
 			wrap_delay(1);
 		} else {
@@ -191,23 +288,23 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 			sleepindex %= sizeof(sleeppattern) / sizeof(sleeppattern[0]);
 		}
 		Bit32s timeslept = GetTicks() - ticksNew;
-		// Count how many times in the current block (of 250 ms) the time slept was 1 ms
-		if (CPU_CycleAutoAdjust && !CPU_SkipCycleAutoAdjust && timeslept == 1) sleep1count++;
+#ifdef __MORPHOS__
+		if (morphos_use_highres_cycles) {
+			/* Exclude the explicit idle sleep from the busy-time accumulator. */
+			morphos_auto_last_us = MORPHOS_GetMicroseconds();
+		} else
+#endif
+		{
+			// Count how many times in the current block (of 250 ms) the time slept was 1 ms
+			if (CPU_CycleAutoAdjust && !CPU_SkipCycleAutoAdjust && timeslept == 1) sleep1count++;
+		}
 		lastsleepDone = ticksDone;
 
-		// Update ticksDone with the time spent sleeping
+		// Update ticksDone with the time spent sleeping for the legacy controller.
 		ticksDone -= timeslept;
 		if (ticksDone < 0)
 			ticksDone = 0;
 		return; //0
-
-		// If we do work this tick and sleep till the next tick, then ticksDone is decreased, 
-		// despite the fact that work was done as well in this tick. Maybe make it depend on an extra parameter.
-		// What do we know: ticksRemain = 0 (condition to enter this function)
-		// ticksNew = time before sleeping
-		
-		// maybe keep track of sleeped time in this frame, and use sleeped and done as indicators. (and take care of the fact there
-		// are frames that have both.
 	}
 
 	//TicksNew > ticksLast
@@ -222,13 +319,23 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
 	// Is the system in auto cycle mode guessing ? If not just exit. (It can be temporary disabled)
 	if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust) return;
+
+	Bit64u scheduled_us = Bit64u(ticksScheduled) * 1000ULL;
+	Bit64u done_us = Bit64u(ticksDone > 0 ? ticksDone : 1) * 1000ULL;
+#ifdef __MORPHOS__
+	if (morphos_use_highres_cycles) {
+		scheduled_us = morphos_auto_scheduled_us;
+		done_us = morphos_auto_busy_us ? morphos_auto_busy_us : 1;
+	}
+#endif
 	
-	if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > 15 && ticksScheduled >= 5) ) {
-		if(ticksDone < 1) ticksDone = 1; // Protect against div by zero
-		/* ratio we are aiming for is around 90% usage*/
-		Bit32s ratio = (ticksScheduled * (CPU_CyclePercUsed*90*1024/100/100)) / ticksDone;
+	if (scheduled_us >= 250000ULL || done_us >= 250000ULL ||
+	    (ticksAdded > 15 && scheduled_us >= 5000ULL)) {
+		/* ratio we are aiming for is around 90% usage */
+		const Bit64u target = Bit64u(CPU_CyclePercUsed) * 90ULL * 1024ULL / 100ULL / 100ULL;
+		Bit32s ratio = (Bit32s)((scheduled_us * target) / done_us);
 		Bit32s new_cmax = CPU_CycleMax;
-		Bit64s cproc = (Bit64s)CPU_CycleMax * (Bit64s)ticksScheduled;
+		const Bit64s cproc = (Bit64s)CPU_CycleMax * (Bit64s)(scheduled_us / 1000ULL);
 		double ratioremoved = 0.0; //increase scope for logging
 		if (cproc > 0) {
 			/* ignore the cycles added due to the IO delay code in order
@@ -240,23 +347,23 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
 				/* Don't allow very high ratio which can cause us to lock as we don't scale down
 				 * for very low ratios. High ratio might result because of timing resolution */
-				if (ticksScheduled >= 250 && ticksDone < 10 && ratio > 16384)
+				if (scheduled_us >= 250000ULL && done_us < 10000ULL && ratio > 16384)
 					ratio = 16384;
 
 				// Limit the ratio even more when the cycles are already way above the realmode default.
-				if (ticksScheduled >= 250 && ticksDone < 10 && ratio > 5120 && CPU_CycleMax > 50000)
+				if (scheduled_us >= 250000ULL && done_us < 10000ULL && ratio > 5120 && CPU_CycleMax > 50000)
 					ratio = 5120;
 
 				// When downscaling multiple times in a row, ensure a minimum amount of downscaling
-				if (ticksAdded > 15 && ticksScheduled >= 5 && ticksScheduled <= 20 && ratio > 800)
+				if (ticksAdded > 15 && scheduled_us >= 5000ULL && scheduled_us <= 20000ULL && ratio > 800)
 					ratio = 800;
 
 				if (ratio <= 1024) {
-					// ratio_not_removed = 1.0; //enabling this restores the old formula
-					double r = (1.0 + ratio_not_removed) /(ratio_not_removed + 1024.0/(static_cast<double>(ratio)));
+					double r = (1.0 + ratio_not_removed) /
+					           (ratio_not_removed + 1024.0 / static_cast<double>(ratio ? ratio : 1));
 					new_cmax = 1 + static_cast<Bit32s>(CPU_CycleMax * r);
 				} else {
-					Bit64s ratio_with_removed = (Bit64s) ((((double)ratio - 1024.0) * ratio_not_removed) + 1024.0);
+					Bit64s ratio_with_removed = (Bit64s)((((double)ratio - 1024.0) * ratio_not_removed) + 1024.0);
 					Bit64s cmax_scaled = (Bit64s)CPU_CycleMax * ratio_with_removed;
 					new_cmax = (Bit32s)(1 + (CPU_CycleMax >> 1) + cmax_scaled / (Bit64s)2048);
 				}
@@ -265,16 +372,6 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
 		if (new_cmax < CPU_CYCLES_LOWER_LIMIT)
 			new_cmax = CPU_CYCLES_LOWER_LIMIT;
-		/*
-		LOG(LOG_MISC,LOG_ERROR)("cyclelog: current %06d   cmax %06d   ratio  %05d  done %03d   sched %03d Add %d rr %4.2f",
-			CPU_CycleMax,
-			new_cmax,
-			ratio,
-			ticksDone,
-			ticksScheduled,
-			ticksAdded,
-			ratioremoved);
-		*/
 
 		/* ratios below 1% are considered to be dropouts due to
 		   temporary load imbalance, the cycles adjusting is skipped */
@@ -282,11 +379,14 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 			/* ratios below 12% along with a large time since the last update
 			   has taken place are most likely caused by heavy load through a
 			   different application, the cycles adjusting is skipped as well */
-			if ((ratio > 120) || (ticksDone < 700)) {
+			if ((ratio > 120) || (done_us < 700000ULL)) {
 				CPU_CycleMax = new_cmax;
 				if (CPU_CycleLimit > 0) {
 					if (CPU_CycleMax > CPU_CycleLimit) CPU_CycleMax = CPU_CycleLimit;
 				} else if (CPU_CycleMax > 2000000) CPU_CycleMax = 2000000; //Hardcoded limit, if no limit was specified.
+#ifdef __MORPHOS__
+				MorphOS_RecordCycleValue(CPU_CycleMax);
+#endif
 			}
 		}
 
@@ -294,16 +394,21 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 		CPU_IODelayRemoved = 0;
 		ticksDone = 0;
 		ticksScheduled = 0;
+#ifdef __MORPHOS__
+		if (morphos_use_highres_cycles) DOSBOX_ResetAutoCycleController();
+#endif
 		lastsleepDone = -1;
 		sleep1count = 0;
-	} else if (ticksAdded > 15) {
-		/* ticksAdded > 15 but ticksScheduled < 5, lower the cycles
-		   but do not reset the scheduled/done ticks to take them into
-		   account during the next auto cycle adjustment */
+	} else if (ticksAdded > 15 && scheduled_us < 5000ULL) {
+		/* ticksAdded > 15 but less than 5 ms was scheduled: lower the cycles,
+		 * but retain the measurements for the next controller update. */
 		CPU_CycleMax /= 3;
 		if (CPU_CycleMax < CPU_CYCLES_LOWER_LIMIT)
 			CPU_CycleMax = CPU_CYCLES_LOWER_LIMIT;
-	} //if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > 15 && ticksScheduled >= 5) )
+#ifdef __MORPHOS__
+		MorphOS_RecordCycleValue(CPU_CycleMax);
+#endif
+	}
 }
 
 void DOSBOX_SetLoop(LoopHandler * handler) {
@@ -349,6 +454,9 @@ static void DOSBOX_RealInit(Section * sec) {
 	ticksRemain=0;
 	ticksLast=GetTicks();
 	ticksLocked = false;
+#ifdef __MORPHOS__
+	DOSBOX_ResetAutoCycleController();
+#endif
 	DOSBOX_SetLoop(&Normal_Loop);
 	MSG_Init(section);
 
@@ -392,7 +500,7 @@ void DOSBOX_Init(void) {
 	Prop_multival* Pmulti;
 	Prop_multival_remain* Pmulti_remain;
 
-	SDLNetInited = false;
+	NetworkInited = false;
 
 	// Some frequently used option sets
 	const char *rates[] = {  "44100", "48000", "32000","22050", "16000", "11025", "8000", "49716", 0 };
@@ -420,6 +528,15 @@ void DOSBOX_Init(void) {
 
 	Pstring = secprop->Add_path("captures",Property::Changeable::Always,"capture");
 	Pstring->Set_help("Directory where things like wave, midi, screenshot get captured.");
+
+	Pbool = secprop->Add_bool("convertdrivefat",Property::Changeable::OnlyAtStart,true);
+	Pbool->Set_help("Expose the first eligible mounted host directory as a virtual FAT16 hard disk when BOOT starts a guest OS.");
+	Pint = secprop->Add_int("convert fat free space",Property::Changeable::OnlyAtStart,250);
+	Pint->SetMinMax(0,2048);
+	Pint->Set_help("Free space in megabytes reported by the converted host-directory FAT disk. A value of 0 creates the minimum FAT16 size.");
+	Pint = secprop->Add_int("convert fat timeout",Property::Changeable::OnlyAtStart,4);
+	Pint->SetMinMax(0,120);
+	Pint->Set_help("Maximum seconds used to scan a mounted directory before guest boot. Zero disables the timeout.");
 
 #if C_DEBUG
 	LOG_StartUp();
@@ -535,6 +652,46 @@ void DOSBOX_Init(void) {
 
 #if defined(PCI_FUNCTIONALITY_ENABLED)
 	secprop=control->AddSection_prop("pci",&PCI_Init,false); //PCI bus
+
+	secprop=control->AddSection_prop("ethernet",&NE2000_Init,false);
+	Pbool=secprop->Add_bool("ne2000",Property::Changeable::OnlyAtStart,false);
+	Pbool->Set_help("Enable an emulated Novell NE2000 ISA Ethernet adapter using a native MorphOS SANA-II backend.");
+	Phex=secprop->Add_hex("nicbase",Property::Changeable::OnlyAtStart,0x300);
+	Phex->Set_help("NE2000 I/O base address. 300 is the common default.");
+	Pint=secprop->Add_int("nicirq",Property::Changeable::OnlyAtStart,3);
+	Pint->Set_help("NE2000 interrupt request line.");
+	Pstring=secprop->Add_string("macaddr",Property::Changeable::OnlyAtStart,"AC:DE:48:88:99:AA");
+	Pstring->Set_help("Compatibility setting. The native MorphOS shared SANA-II backend always uses the station address of the selected unit so the host network stack can remain online.");
+	Pstring=secprop->Add_string("sana2_device",Property::Changeable::OnlyAtStart,"DEVS:Networks/rtl8139.device");
+	Pstring->Set_help("MorphOS SANA-II network device path.");
+	Pint=secprop->Add_int("sana2_unit",Property::Changeable::OnlyAtStart,0);
+	Pint->Set_help("SANA-II device unit.");
+
+	secprop=control->AddSection_prop("voodoo",&VOODOO_Init,false);
+	const char *voodoo_cards[] = { "false", "software", "tinygl", 0 };
+	Pstring=secprop->Add_string("voodoo_card",Property::Changeable::OnlyAtStart,"false");
+	Pstring->Set_values(voodoo_cards);
+	Pstring->Set_help("Enable low-level 3dfx Voodoo Graphics SST-1 emulation. software uses the complete DOSBox-X/Aaron Giles rasterizer. tinygl uses the same complete SST-1 core and translates triangle, texture, depth, blend, clear, swap and LFB raster operations directly to native MorphOS TinyGL.");
+	const char *voodoo_submit_modes[] = { "immediate", "arrays", "vbo", "vbo-indexed", 0 };
+	Pstring=secprop->Add_string("voodoo_tinygl_submission",Property::Changeable::OnlyAtStart,"arrays");
+	Pstring->Set_values(voodoo_submit_modes);
+	Pstring->Set_help("TinyGL triangle submission backend. immediate uses GLBegin/GLEnd for compatibility. arrays batches triangles in aligned CPU memory and submits them with glDrawArrays. vbo streams the same batches through a TinyGL vertex buffer object using the R300-safe pointer-offset path. vbo-indexed uses glDrawElements so the VBO attribute pointers are configured once per upload instead of once per draw. The setting is visible in the MorphOS configuration GUI and applies after restarting DOSBox.");
+	const char *voodoo_tuning_modes[] = { "safe", "fast", "max", 0 };
+	Pstring=secprop->Add_string("voodoo_tinygl_tuning",Property::Changeable::OnlyAtStart,"fast");
+	Pstring->Set_values(voodoo_tuning_modes);
+	Pstring->Set_help("TinyGL performance profile. safe preserves the legacy reciprocal texture-coordinate path and v5.8 limits. fast uses exact SST-scaled homogeneous S/T/Q coordinates, cached texture setup, reduced vertex colour work, larger batches/cache and conservative off-screen rejection. max uses the same geometry optimisations with the largest batch/cache and more graphics memory.");
+	Pbool=secprop->Add_bool("voodoo_tinygl_statecache",Property::Changeable::OnlyAtStart,true);
+	Pbool->Set_help("Cache the last decoded SST draw state while building the VBO queue. Disable this switch for direct A/B performance and compatibility testing. Applies after restarting DOSBox.");
+	Pbool=secprop->Add_bool("voodoo_tinygl_shader_support",Property::Changeable::OnlyAtStart,false);
+	Pbool->Set_help("Use the optional R300 TinyGL GLSL renderer for SST texture combiners, dual TMU, alpha/chroma tests and fog. The fixed-function renderer remains the automatic fallback if shader compilation or runtime capability checks fail. Requires vbo or vbo-indexed and applies after restarting DOSBox.");
+	Pbool=secprop->Add_bool("voodoo_debug",Property::Changeable::OnlyAtStart,false);
+	Pbool->Set_help("Enable Voodoo diagnostic logging and expensive runtime data collection. Keep disabled for normal use to avoid unnecessary CPU overhead. Applies after restarting DOSBox.");
+	const char *voodoo_memory[] = { "4", "12", 0 };
+	Pint=secprop->Add_int("voodoo_memsize",Property::Changeable::OnlyAtStart,4);
+	Pint->Set_values(voodoo_memory);
+	Pint->Set_help("Voodoo memory configuration in MB: 4 provides one 2 MB TMU; 12 provides two 4 MB TMUs and 4 MB framebuffer memory.");
+	Pbool=secprop->Add_bool("voodoo_bilinear_filtering",Property::Changeable::OnlyAtStart,true);
+	Pbool->Set_help("Compatibility option retained for existing configurations. Texture filtering is controlled by the emulated SST-1 registers.");
 #endif
 
 
@@ -675,7 +832,6 @@ void DOSBOX_Init(void) {
 
 	secprop=control->AddSection_prop("joystick",&BIOS_Init,false);//done
 	secprop->AddInitFunction(&INT10_Init);
-	secprop->AddInitFunction(&MOUSE_Init); //Must be after int10 as it uses CurMode
 	secprop->AddInitFunction(&JOYSTICK_Init,true);
 	const char* joytypes[] = { "auto", "2axis", "4axis", "4axis_2", "fcs", "ch", "none",0};
 	Pstring = secprop->Add_string("joysticktype",Property::Changeable::WhenIdle,"auto");
@@ -710,6 +866,19 @@ void DOSBOX_Init(void) {
 	Pint->SetMinMax(0,100);
 	Pint->Set_help("the percentage of motion to ignore. 100 turns the stick into a digital one.");
 
+	/* Keep mouse initialization after INT10.  DOSBox-X provides separate
+	 * guest drivers for Windows 3.1 and Windows 95, both using its integration
+	 * I/O device at ports 28h-2Bh. */
+	const char *mouse_integration_modes[] = { "none", "win31", "win95", 0 };
+	secprop=control->AddSection_prop("mouse_integration",&MOUSE_Init,true);
+	Pstring = secprop->Add_string("mode",Property::Changeable::OnlyAtStart,"none");
+	Pstring->Set_values(mouse_integration_modes);
+	Pstring->Set_help("Absolute mouse integration mode. none uses the normal captured mouse. win31 and win95 enable the DOSBox-X integration device at I/O ports 28h-2Bh for the matching guest driver.");
+	const char *mouse_pointer_modes[] = { "windows_only", "both", "morphos_only", 0 };
+	Pstring = secprop->Add_string("pointer",Property::Changeable::OnlyAtStart,"windows_only");
+	Pstring->Set_values(mouse_pointer_modes);
+	Pstring->Set_help("Pointer display while an integration driver is active. Windows only hides the MorphOS pointer. Both shows the Windows and MorphOS pointers. MorphOS only shows the MorphOS pointer and suppresses the emulated S3 hardware cursor used by Windows.");
+
 	secprop=control->AddSection_prop("serial",&SERIAL_Init,true);
 	const char* serials[] = { "dummy", "disabled", "modem", "nullmodem",
 	                          "directserial",0 };
@@ -730,6 +899,13 @@ void DOSBOX_Init(void) {
 		"for nullmodem: server, rxdelay, txdelay, telnet, usedtr,\n"
 		"               transparent, port, inhsocket (all optional).\n"
 		"Example: serial1=modem listenport:5000");
+#ifdef __MORPHOS__
+	Pstring = secprop->Add_string("serial1_device",Property::Changeable::WhenIdle,"serial.device");
+	Pstring->Set_help("MorphOS device used by directserial.");
+	Pint = secprop->Add_int("serial1_unit",Property::Changeable::WhenIdle,0);
+	Pint->SetMinMax(0,255);
+	Pint->Set_help("MorphOS device unit used by directserial.");
+#endif
 
 	Pmulti_remain = secprop->Add_multiremain("serial2",Property::Changeable::WhenIdle," ");
 	Pstring = Pmulti_remain->GetSection()->Add_string("type",Property::Changeable::WhenIdle,"dummy");
@@ -737,6 +913,13 @@ void DOSBOX_Init(void) {
 	Pstring->Set_values(serials);
 	Pstring = Pmulti_remain->GetSection()->Add_string("parameters",Property::Changeable::WhenIdle,"");
 	Pmulti_remain->Set_help("see serial1");
+#ifdef __MORPHOS__
+	Pstring = secprop->Add_string("serial2_device",Property::Changeable::WhenIdle,"serial.device");
+	Pstring->Set_help("MorphOS device used by directserial.");
+	Pint = secprop->Add_int("serial2_unit",Property::Changeable::WhenIdle,1);
+	Pint->SetMinMax(0,255);
+	Pint->Set_help("MorphOS device unit used by directserial.");
+#endif
 
 	Pmulti_remain = secprop->Add_multiremain("serial3",Property::Changeable::WhenIdle," ");
 	Pstring = Pmulti_remain->GetSection()->Add_string("type",Property::Changeable::WhenIdle,"disabled");
@@ -744,6 +927,13 @@ void DOSBOX_Init(void) {
 	Pstring->Set_values(serials);
 	Pstring = Pmulti_remain->GetSection()->Add_string("parameters",Property::Changeable::WhenIdle,"");
 	Pmulti_remain->Set_help("see serial1");
+#ifdef __MORPHOS__
+	Pstring = secprop->Add_string("serial3_device",Property::Changeable::WhenIdle,"serial.device");
+	Pstring->Set_help("MorphOS device used by directserial.");
+	Pint = secprop->Add_int("serial3_unit",Property::Changeable::WhenIdle,2);
+	Pint->SetMinMax(0,255);
+	Pint->Set_help("MorphOS device unit used by directserial.");
+#endif
 
 	Pmulti_remain = secprop->Add_multiremain("serial4",Property::Changeable::WhenIdle," ");
 	Pstring = Pmulti_remain->GetSection()->Add_string("type",Property::Changeable::WhenIdle,"disabled");
@@ -751,6 +941,13 @@ void DOSBOX_Init(void) {
 	Pstring->Set_values(serials);
 	Pstring = Pmulti_remain->GetSection()->Add_string("parameters",Property::Changeable::WhenIdle,"");
 	Pmulti_remain->Set_help("see serial1");
+#ifdef __MORPHOS__
+	Pstring = secprop->Add_string("serial4_device",Property::Changeable::WhenIdle,"serial.device");
+	Pstring->Set_help("MorphOS device used by directserial.");
+	Pint = secprop->Add_int("serial4_unit",Property::Changeable::WhenIdle,3);
+	Pint->SetMinMax(0,255);
+	Pint->Set_help("MorphOS device unit used by directserial.");
+#endif
 
 
 	/* All the DOS Related stuff, which will eventually start up in the shell */

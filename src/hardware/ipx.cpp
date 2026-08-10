@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "cross.h"
 #include "support.h"
 #include "cpu.h"
@@ -37,7 +38,26 @@
 #include "ipx.h"
 #include "ipxserver.h"
 #include "timer.h"
+#ifdef __MORPHOS__
+#include "morphos_net.h"
+#else
 #include "SDL_net.h"
+#endif
+
+#ifdef __MORPHOS__
+#define SDLNet_Init MORPHOSNet_Init
+#define SDLNet_GetError MORPHOSNet_GetError
+#define SDLNet_ResolveHost MORPHOSNet_ResolveHost
+#define SDLNet_UDP_Open MORPHOSNet_UDP_Open
+#define SDLNet_UDP_Close MORPHOSNet_UDP_Close
+#define SDLNet_UDP_Bind MORPHOSNet_UDP_Bind
+#define SDLNet_UDP_Send MORPHOSNet_UDP_Send
+#define SDLNet_UDP_Recv MORPHOSNet_UDP_Recv
+#define SDLNet_Read16 MORPHOSNet_Read16
+#define SDLNet_Read32 MORPHOSNet_Read32
+#define SDLNet_Write16 MORPHOSNet_Write16
+#define SDLNet_Write32 MORPHOSNet_Write32
+#endif
 #include "programs.h"
 #include "pic.h"
 
@@ -301,7 +321,10 @@ static void OpenSocket(void) {
 	reg_dx = swapByte(sockNum);  // Convert back to big-endian
 }
 
-static void CloseSocket(void) {
+// MorphOS <proto/socket.h> exposes CloseSocket as an inline macro/function.
+// Keep the DOSBox IPX service helper distinctly named so future merges do not
+// reintroduce a preprocessor collision with bsdsocket.library.
+static void CloseIpxSocket(void) {
 	Bit16u sockNum, i;
 	ECBClass* tmpECB = ECBList;
 	ECBClass* tmp2ECB = ECBList;
@@ -373,7 +396,7 @@ static void handleIpxRequest(void) {
 			break;
 		case 0x0001:	// Close socket
 			LOG_IPX("IPX: Close socket %4x", swapByte(reg_dx));
-			CloseSocket();
+			CloseIpxSocket();
 			break;
 		case 0x0002:	// get local target
 						// es:si
@@ -1094,12 +1117,12 @@ public:
 	IPX(Section* configuration):Module_base(configuration) {
 		Section_prop * section = static_cast<Section_prop *>(configuration);
 		if(!section->Get_bool("ipx")) return;
-		if(!SDLNetInited) {
+		if(!NetworkInited) {
 			if(SDLNet_Init() == -1){
 				LOG_MSG("SDLNet_Init failed: %s\n", SDLNet_GetError());
 				return;
 			}
-			SDLNetInited = true;
+			NetworkInited = true;
 		}
 
 		ECBList = NULL;

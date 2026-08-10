@@ -205,11 +205,16 @@ public:
 
 		/* Show list of cdroms */
 		if (cmd->FindExist("-cd",false)) {
+#ifdef __MORPHOS__
+            WriteOut(MSG_Get("PROGRAM_MOUNT_CDROMS_FOUND"),0);
+            WriteOut("MorphOS native build: mount an ISO/CUE image or a directory.\n");
+#else
 			int num = SDL_CDNumDrives();
    			WriteOut(MSG_Get("PROGRAM_MOUNT_CDROMS_FOUND"),num);
 			for (int i=0; i<num; i++) {
 				WriteOut("%2d. %s\n",i,SDL_CDName(i));
-			};
+			}
+#endif
 			return;
 		}
 
@@ -671,12 +676,18 @@ public:
 
 		FILE *usefile_1=NULL;
 		FILE *usefile_2=NULL;
-		Bitu i=0; 
+		Bitu i=0;
+		Bitu image_index=0;
 		Bit32u floppysize=0;
 		Bit32u rombytesize_1=0;
 		Bit32u rombytesize_2=0;
 		Bit8u drive = 'A';
 		std::string cart_cmd="";
+		Section_prop *dosbox_section=static_cast<Section_prop *>(control->GetSection("dosbox"));
+		bool convert_fat=dosbox_section->Get_bool("convertdrivefat");
+		bool convert_fat_readonly=false;
+		Bit32u convert_fat_free=(Bit32u)dosbox_section->Get_int("convert fat free space");
+		int convert_fat_timeout=dosbox_section->Get_int("convert fat timeout");
 
 		if(!cmd->GetCount()) {
 			printError();
@@ -684,6 +695,15 @@ public:
 		}
 		while(i<cmd->GetCount()) {
 			if(cmd->FindCommand(i+1, temp_line)) {
+				if(!strcasecmp(temp_line.c_str(),"-convertfat")) {
+					convert_fat=true; convert_fat_readonly=false; i++; continue;
+				}
+				if(!strcasecmp(temp_line.c_str(),"-convertfatro")) {
+					convert_fat=true; convert_fat_readonly=true; i++; continue;
+				}
+				if(!strcasecmp(temp_line.c_str(),"-noconvertfat")) {
+					convert_fat=false; i++; continue;
+				}
 				if((temp_line == "-l") || (temp_line == "-L")) {
 					/* Specifying drive... next argument then is the drive */
 					i++;
@@ -716,15 +736,14 @@ public:
 					continue;
 				}
 				
-				if ( i >= MAX_SWAPPABLE_DISKS ) {
-					return; //TODO give a warning.
-				}
+				if (image_index >= MAX_SWAPPABLE_DISKS) return;
 				WriteOut(MSG_Get("PROGRAM_BOOT_IMAGE_OPEN"), temp_line.c_str());
 				Bit32u rombytesize;
 				FILE *usefile = getFSFile(temp_line.c_str(), &floppysize, &rombytesize);
 				if(usefile != NULL) {
-					if(diskSwap[i] != NULL) delete diskSwap[i];
-					diskSwap[i] = new imageDisk(usefile, temp_line.c_str(), floppysize, false);
+					if(diskSwap[image_index] != NULL) delete diskSwap[image_index];
+					diskSwap[image_index] = new imageDisk(usefile, temp_line.c_str(), floppysize, false);
+					image_index++;
 					if (usefile_1==NULL) {
 						usefile_1=usefile;
 						rombytesize_1=rombytesize;
@@ -748,6 +767,15 @@ public:
 		if(imageDiskList[drive-65]==NULL) {
 			WriteOut(MSG_Get("PROGRAM_BOOT_UNABLE"), drive);
 			return;
+		}
+
+		if (convert_fat) {
+			Bit8u source_drive=0xff;
+			if (BIOS_ConvertMountedDriveToFAT(convert_fat_free,convert_fat_timeout,
+			                                    convert_fat_readonly,(Bit8u)(drive-'A'),&source_drive))
+				WriteOut(MSG_Get("PROGRAM_BOOT_CONVERT_FAT"),'A'+source_drive,convert_fat_readonly?"read-only":"overlay");
+			else
+				WriteOut(MSG_Get("PROGRAM_BOOT_CONVERT_FAT_NONE"));
 		}
 
 		bootSector bootarea;
@@ -1786,12 +1814,15 @@ void DOS_SetupPrograms(void) {
 		"drive (C or D), the image should have already been mounted using the\n"
 		"\033[34;1mIMGMOUNT\033[0m command.\n\n"
 		"The syntax of this command is:\n\n"
-		"\033[34;1mBOOT [diskimg1.img diskimg2.img] [-l driveletter]\033[0m\n"
+		"\033[34;1mBOOT [diskimg1.img diskimg2.img] [-l driveletter]\n"
+		"     [-convertfat|-convertfatro|-noconvertfat]\033[0m\n"
 		);
 	MSG_Add("PROGRAM_BOOT_UNABLE","Unable to boot off of drive %c");
 	MSG_Add("PROGRAM_BOOT_IMAGE_OPEN","Opening image file: %s\n");
 	MSG_Add("PROGRAM_BOOT_IMAGE_NOT_OPEN","Cannot open %s");
 	MSG_Add("PROGRAM_BOOT_BOOT","Booting from drive %c...\n");
+	MSG_Add("PROGRAM_BOOT_CONVERT_FAT","Mounted directory %c: exposed as BIOS hard disk 81h (%s writes).\n");
+	MSG_Add("PROGRAM_BOOT_CONVERT_FAT_NONE","No eligible mounted directory could be exposed as BIOS hard disk 81h.\n");
 	MSG_Add("PROGRAM_BOOT_CART_WO_PCJR","PCjr cartridge found, but machine is not PCjr");
 	MSG_Add("PROGRAM_BOOT_CART_LIST_CMDS","Available PCjr cartridge commandos:%s");
 	MSG_Add("PROGRAM_BOOT_CART_NO_CMDS","No PCjr cartridge commandos found");

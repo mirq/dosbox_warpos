@@ -35,7 +35,11 @@
 #include <mmsystem.h>
 #endif
 
+#ifndef __MORPHOS__
 #include "SDL.h"
+#else
+#include "morphos_audio.h"
+#endif
 #include "mem.h"
 #include "pic.h"
 #include "dosbox.h"
@@ -48,6 +52,14 @@
 #include "hardware.h"
 #include "programs.h"
 #include "midi.h"
+
+#ifdef __MORPHOS__
+#define MIXER_LOCK_AUDIO() MORPHOS_AudioLock()
+#define MIXER_UNLOCK_AUDIO() MORPHOS_AudioUnlock()
+#else
+#define MIXER_LOCK_AUDIO() SDL_LockAudio()
+#define MIXER_UNLOCK_AUDIO() SDL_UnlockAudio()
+#endif
 
 #define MIXER_SSIZE 4
 
@@ -89,6 +101,12 @@ static struct {
 } mixer;
 
 Bit8u MixTemp[MIXER_BUFSIZE];
+
+#if defined(__MORPHOS__) && defined(C_MORPHOS_AHI_STATS) && C_MORPHOS_AHI_STATS
+static Bit32u morphos_mixer_full_underruns = 0;
+static Bit32u morphos_mixer_partial_underruns = 0;
+static Bit32u morphos_mixer_overflows = 0;
+#endif
 
 MixerChannel * MIXER_AddChannel(MIXER_Handler handler,Bitu freq,const char * name) {
 	MixerChannel * chan=new MixerChannel();
@@ -148,9 +166,15 @@ void MixerChannel::Enable(bool _yesno) {
 	enabled=_yesno;
 	if (enabled) {
 		freq_counter = 0;
-		SDL_LockAudio();
-		if (done<mixer.done) done=mixer.done;
-		SDL_UnlockAudio();
+#ifdef __MORPHOS__
+        MORPHOS_AudioLock();
+        if (done<mixer.done) done=mixer.done;
+        MORPHOS_AudioUnlock();
+#else
+        MIXER_LOCK_AUDIO();
+        if (done<mixer.done) done=mixer.done;
+        MIXER_UNLOCK_AUDIO();
+#endif
 	}
 }
 
@@ -382,14 +406,14 @@ void MixerChannel::AddSamples_s32_nonnative(Bitu len,const Bit32s * data) {
 }
 
 void MixerChannel::FillUp(void) {
-	SDL_LockAudio();
+	MIXER_LOCK_AUDIO();
 	if (!enabled || done<mixer.done) {
-		SDL_UnlockAudio();
+		MIXER_UNLOCK_AUDIO();
 		return;
 	}
 	float index=PIC_TickIndex();
 	Mix((Bitu)(index*mixer.needed));
-	SDL_UnlockAudio();
+	MIXER_UNLOCK_AUDIO();
 }
 
 extern bool ticksLocked;
@@ -439,12 +463,12 @@ static void MIXER_MixData(Bitu needed) {
 }
 
 static void MIXER_Mix(void) {
-	SDL_LockAudio();
+	MIXER_LOCK_AUDIO();
 	MIXER_MixData(mixer.needed);
 	mixer.tick_counter += mixer.tick_add;
 	mixer.needed+=(mixer.tick_counter >> TICK_SHIFT);
 	mixer.tick_counter &= TICK_MASK;
-	SDL_UnlockAudio();
+	MIXER_UNLOCK_AUDIO();
 }
 
 static void MIXER_Mix_NoSound(void) {
@@ -467,7 +491,11 @@ static void MIXER_Mix_NoSound(void) {
 	mixer.done=0;
 }
 
+#ifdef __MORPHOS__
+static void MIXER_CallBack(void * userdata, Bit8u *stream, Bitu len) {
+#else
 static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
+#endif
 	Bitu need=(Bitu)len/MIXER_SSIZE;
 	Bit16s * output=(Bit16s *)stream;
 	Bitu reduce;
@@ -478,14 +506,21 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
 	/* Enough room in the buffer ? */
 	if (mixer.done < need) {
 //		LOG_MSG("Full underrun need %d, have %d, min %d", need, mixer.done, mixer.min_needed);
-		if((need - mixer.done) > (need >>7) ) //Max 1 procent stretch.
+		if((need - mixer.done) > (need >>7) ) { //Max 1 procent stretch.
+#if defined(__MORPHOS__) && defined(C_MORPHOS_AHI_STATS) && C_MORPHOS_AHI_STATS
+            ++morphos_mixer_full_underruns;
+#endif
 			return;
+        }
 		reduce = mixer.done;
 		index_add = (reduce << TICK_SHIFT) / need;
 		mixer.tick_add = calc_tickadd(mixer.freq+mixer.min_needed);
 	} else if (mixer.done < mixer.max_needed) {
 		Bitu left = mixer.done - need;
 		if (left < mixer.min_needed) {
+#if defined(__MORPHOS__) && defined(C_MORPHOS_AHI_STATS) && C_MORPHOS_AHI_STATS
+            ++morphos_mixer_partial_underruns;
+#endif
 			if( !Mixer_irq_important() ) {
 				Bitu needed = mixer.needed - need;
 				Bitu diff = (mixer.min_needed>needed?mixer.min_needed:needed) - left;
@@ -519,6 +554,9 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
 				mixer.tick_add = calc_tickadd(mixer.freq);
 		}
 	} else {
+#if defined(__MORPHOS__) && defined(C_MORPHOS_AHI_STATS) && C_MORPHOS_AHI_STATS
+        ++morphos_mixer_overflows;
+#endif
 		/* There is way too much data in the buffer */
 //		LOG_MSG("overflow run need %d, have %d, min %d", need, mixer.done, mixer.min_needed);
 		if (mixer.done > MIXER_BUFSIZE)
@@ -575,6 +613,15 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
 }
 
 static void MIXER_Stop(Section* sec) {
+#ifdef __MORPHOS__
+    MORPHOS_AudioClose();
+#if defined(C_MORPHOS_AHI_STATS) && C_MORPHOS_AHI_STATS
+    LOG_MSG("MorphOS mixer stats: full-underruns=%lu partial-underruns=%lu overflows=%lu",
+            (unsigned long)morphos_mixer_full_underruns,
+            (unsigned long)morphos_mixer_partial_underruns,
+            (unsigned long)morphos_mixer_overflows);
+#endif
+#endif
 }
 
 class MIXER : public Program {
@@ -678,36 +725,59 @@ void MIXER_Init(Section* sec) {
 	memset(mixer.work,0,sizeof(mixer.work));
 	mixer.mastervol[0]=1.0f;
 	mixer.mastervol[1]=1.0f;
+#if defined(__MORPHOS__) && defined(C_MORPHOS_AHI_STATS) && C_MORPHOS_AHI_STATS
+    morphos_mixer_full_underruns = 0;
+    morphos_mixer_partial_underruns = 0;
+    morphos_mixer_overflows = 0;
+#endif
 
-	/* Start the Mixer using SDL Sound at 22 khz */
-	SDL_AudioSpec spec;
-	SDL_AudioSpec obtained;
-
-	spec.freq=mixer.freq;
-	spec.format=AUDIO_S16SYS;
-	spec.channels=2;
-	spec.callback=MIXER_CallBack;
-	spec.userdata=NULL;
-	spec.samples=(Uint16)mixer.blocksize;
-
+	/* Start the host audio backend. MorphOS uses AHI directly. */
 	mixer.tick_counter=0;
 	if (mixer.nosound) {
 		LOG_MSG("MIXER: No Sound Mode Selected.");
 		mixer.tick_add=calc_tickadd(mixer.freq);
 		TIMER_AddTickHandler(MIXER_Mix_NoSound);
-	} else if (SDL_OpenAudio(&spec, &obtained) <0 ) {
-		mixer.nosound = true;
-		LOG_MSG("MIXER: Can't open audio: %s , running in nosound mode.",SDL_GetError());
-		mixer.tick_add=calc_tickadd(mixer.freq);
-		TIMER_AddTickHandler(MIXER_Mix_NoSound);
 	} else {
-		if ((mixer.freq != static_cast<Bit32u>(obtained.freq)) || (mixer.blocksize != obtained.samples))
-			LOG_MSG("MIXER: Got different values from SDL: freq %d, blocksize %d",obtained.freq,obtained.samples);
-		mixer.freq=obtained.freq;
-		mixer.blocksize=obtained.samples;
-		mixer.tick_add=calc_tickadd(mixer.freq);
-		TIMER_AddTickHandler(MIXER_Mix);
-		SDL_PauseAudio(0);
+#ifdef __MORPHOS__
+        Bitu obtained_freq = mixer.freq;
+        Bitu obtained_frames = mixer.blocksize;
+        if (!MORPHOS_AudioOpen(mixer.freq, mixer.blocksize, MIXER_CallBack, NULL,
+                               obtained_freq, obtained_frames)) {
+            mixer.nosound = true;
+            LOG_MSG("MIXER: Can't open AHI, running in nosound mode.");
+            mixer.tick_add=calc_tickadd(mixer.freq);
+            TIMER_AddTickHandler(MIXER_Mix_NoSound);
+        } else {
+            mixer.freq = obtained_freq;
+            mixer.blocksize = obtained_frames;
+            mixer.tick_add=calc_tickadd(mixer.freq);
+            TIMER_AddTickHandler(MIXER_Mix);
+            MORPHOS_AudioPause(false);
+        }
+#else
+        SDL_AudioSpec spec;
+        SDL_AudioSpec obtained;
+        spec.freq=mixer.freq;
+        spec.format=AUDIO_S16SYS;
+        spec.channels=2;
+        spec.callback=MIXER_CallBack;
+        spec.userdata=NULL;
+        spec.samples=(Uint16)mixer.blocksize;
+        if (SDL_OpenAudio(&spec, &obtained) <0 ) {
+            mixer.nosound = true;
+            LOG_MSG("MIXER: Can't open audio: %s , running in nosound mode.",SDL_GetError());
+            mixer.tick_add=calc_tickadd(mixer.freq);
+            TIMER_AddTickHandler(MIXER_Mix_NoSound);
+        } else {
+            if ((mixer.freq != static_cast<Bit32u>(obtained.freq)) || (mixer.blocksize != obtained.samples))
+                LOG_MSG("MIXER: Got different values from SDL: freq %d, blocksize %d",obtained.freq,obtained.samples);
+            mixer.freq=obtained.freq;
+            mixer.blocksize=obtained.samples;
+            mixer.tick_add=calc_tickadd(mixer.freq);
+            TIMER_AddTickHandler(MIXER_Mix);
+            SDL_PauseAudio(0);
+        }
+#endif
 	}
 	//1000 = 8 *125
 	mixer.tick_counter = (mixer.freq%125)?TICK_NEXT:0;

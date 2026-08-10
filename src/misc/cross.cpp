@@ -62,6 +62,15 @@ void Cross::GetPlatformConfigDir(std::string& in) {
 #elif defined(MACOSX)
 	in = "~/Library/Preferences";
 	ResolveHomedir(in);
+#elif defined(__MORPHOS__)
+	/* AmigaDOS device paths use the colon as their separator.  Appending the
+	 * Unix CROSS_FILESPLIT here would produce PROGDIR:/dosbox.conf, which is
+	 * not the same path as PROGDIR:dosbox.conf on MorphOS and made the MUI
+	 * Save action appear to succeed while writing to the wrong location (or
+	 * fail outright, depending on the C library).  Keep this explicit so a
+	 * future upstream merge does not reintroduce the slash. */
+	in = "PROGDIR:";
+	return;
 #else
 	in = "~/.dosbox";
 	ResolveHomedir(in);
@@ -92,7 +101,9 @@ void Cross::CreatePlatformConfigDir(std::string& in) {
 	ResolveHomedir(in);
 	//Don't create it. Assume it exists
 #elif defined(__MORPHOS__)
+	/* PROGDIR: is an assign/device path, not a Unix directory name. */
 	in = "PROGDIR:";
+	return;
 #else
 	in = "~/.dosbox";
 	ResolveHomedir(in);

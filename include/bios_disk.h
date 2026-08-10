@@ -55,7 +55,9 @@ public:
 	Bit8u GetBiosType(void);
 	Bit32u getSectSize(void);
 	imageDisk(FILE *imgFile, const char *imgName, Bit32u imgSizeK, bool isHardDisk);
-	~imageDisk() { if(diskimg != NULL) { fclose(diskimg); }	};
+	imageDisk(DOS_Drive *drive, unsigned letter, Bit32u freeMB, int timeout, bool readOnly);
+	~imageDisk();
+	bool IsConvertedFAT(void) const;
 
 	bool hardDrive;
 	bool active;
@@ -66,12 +68,15 @@ public:
 	Bit32u sector_size;
 	Bit32u heads,cylinders,sectors;
 private:
+	struct fatFromDOSDrive *ffdd;
+	Bit8u source_drive;
 	Bit32u current_fpos;
 	enum { NONE,READ,WRITE } last_action;
 };
 
 void updateDPT(void);
 void incrementFDD(void);
+Bitu BIOS_ConvertMountedDriveToFAT(Bit32u freeMB,int timeout,bool readOnly,Bit8u skipDrive,Bit8u *sourceDrive);
 
 #define MAX_HDD_IMAGES 2
 

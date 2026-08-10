@@ -52,12 +52,12 @@ TCPClientSocket::TCPClientSocket(int platformsocket) {
 	
 	mysock = (TCPsocket)nativetcpstruct;
 	isopen = false;
-	if(!SDLNetInited) {
+	if(!NetworkInited) {
         if(SDLNet_Init()==-1) {
 			LOG_MSG("SDLNet_Init failed: %s\n", SDLNet_GetError());
 			return;
 		}
-		SDLNetInited = true;
+		NetworkInited = true;
 	}
 	// fill the SDL socket manually
 	((struct _TCPsocketX*)nativetcpstruct)->ready=0;
@@ -109,12 +109,12 @@ TCPClientSocket::TCPClientSocket(TCPsocket source) {
 #endif
 	sendbuffer=0;
 	isopen = false;
-	if(!SDLNetInited) {
+	if(!NetworkInited) {
         if(SDLNet_Init()==-1) {
 			LOG_MSG("SDLNet_Init failed: %s\n", SDLNet_GetError());
 			return;
 		}
-		SDLNetInited = true;
+		NetworkInited = true;
 	}	
 	
 	mysock=0;
@@ -134,12 +134,12 @@ TCPClientSocket::TCPClientSocket(const char* destination, Bit16u port) {
 #endif
 	sendbuffer=0;
 	isopen = false;
-	if(!SDLNetInited) {
+	if(!NetworkInited) {
         if(SDLNet_Init()==-1) {
 			LOG_MSG("SDLNet_Init failed: %s\n", SDLNet_GetError());
 			return;
 		}
-		SDLNetInited = true;
+		NetworkInited = true;
 	}	
 	mysock=0;
 	listensocketset=0;
@@ -293,12 +293,12 @@ TCPServerSocket::TCPServerSocket(Bit16u port)
 {
 	isopen = false;
 	mysock = 0;
-	if(!SDLNetInited) {
+	if(!NetworkInited) {
         if(SDLNet_Init()==-1) {
 			LOG_MSG("SDLNet_Init failed: %s\n", SDLNet_GetError());
 			return;
 		}
-		SDLNetInited = true;
+		NetworkInited = true;
 	}
 	if (port) {
 		IPaddress listen_ip;

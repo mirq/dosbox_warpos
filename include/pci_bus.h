@@ -19,7 +19,9 @@
 #ifndef DOSBOX_PCI_H
 #define DOSBOX_PCI_H
 
-//#define PCI_FUNCTIONALITY_ENABLED 0
+#if defined(__MORPHOS__) && !defined(PCI_FUNCTIONALITY_ENABLED)
+#define PCI_FUNCTIONALITY_ENABLED 1
+#endif
 
 #if defined PCI_FUNCTIONALITY_ENABLED
 
@@ -39,6 +41,7 @@ private:
 
 public:
 	PCI_Device(Bit16u vendor, Bit16u device);
+	virtual ~PCI_Device(void) { }
 
 	Bits PCIId(void) {
 		return pci_id;
@@ -80,6 +83,8 @@ public:
 bool PCI_IsInitialized();
 
 RealPt PCI_GetPModeInterface(void);
+Bits PCI_RegisterDevice(PCI_Device *device, Bits slot=-1);
+void PCI_RemoveDevice(Bit16u vendor_id, Bit16u device_id);
 
 #endif
 

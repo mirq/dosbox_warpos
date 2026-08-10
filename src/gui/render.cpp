@@ -33,7 +33,9 @@
 
 #include "render_scalers.h"
 
+#ifndef __MORPHOS__
 #include "SDL_opengl.h"
+#endif
 
 
 #include <stdlib.h>
@@ -48,7 +50,9 @@
 #endif
 
 #include "cross.h"
+#ifndef __MORPHOS__
 #include "SDL.h"
+#endif
 
 #include "dosbox.h"
 #include "video.h"
@@ -66,6 +70,7 @@
 #include "control.h"
 
 
+#ifndef __MORPHOS__
 enum PRIORITY_LEVELS {
 	PRIORITY_LEVEL_PAUSE,
 	PRIORITY_LEVEL_LOWEST,
@@ -162,10 +167,13 @@ struct SDL_Block {
 	Bit8u raltstate;
 };
 
+#endif /* !__MORPHOS__ SDL frontend state */
+
 Render_t render;
 ScalerLineHandler_t RENDER_DrawLine;
 
 static void RENDER_CallBack( GFX_CallBackFunctions_t function );
+#ifndef __MORPHOS__
 extern SDL_Block sdl;
 
 Bitu inline GFX_GetRGB(Bit8u red,Bit8u green,Bit8u blue) {
@@ -221,6 +229,8 @@ Bitu inline GFX_GetRGB(Bit8u red,Bit8u green,Bit8u blue) {
 	}
 	return 0;
 }
+
+#endif /* !__MORPHOS__ */
 
 
 static inline void Check_Palette(void) {

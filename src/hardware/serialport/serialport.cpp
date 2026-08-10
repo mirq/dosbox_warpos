@@ -29,6 +29,7 @@
 #include "callback.h"				// CALLBACK_Idle
 
 #include "serialport.h"
+#include "timer.h"
 #include "directserial.h"
 #include "serialdummy.h"
 #include "softmodem.h"
@@ -202,7 +203,7 @@ void CSerial::log_ser(bool active, char const* format,...) {
 		// copied from DEBUG_SHOWMSG
 		char buf[512];
 		buf[0]=0;
-		sprintf(buf,"%12.3f [% 7u] ",PIC_FullIndex(), SDL_GetTicks());
+		sprintf(buf,"%12.3f [% 7u] ",PIC_FullIndex(), GetTicks());
 		va_list msg;
 		va_start(msg,format);
 		vsprintf(buf+strlen(buf),format,msg);
@@ -1231,7 +1232,22 @@ public:
 			s_property[6] = '1' + i;
 			Prop_multival* p = section->Get_multival(s_property);
 			std::string type = p->GetSection()->Get_string("type");
-			CommandLine cmd(0,p->GetSection()->Get_string("parameters"));
+			std::string parameters = p->GetSection()->Get_string("parameters");
+#ifdef __MORPHOS__
+			if (type == "directserial" && parameters.find("realport:") == std::string::npos) {
+				char device_property[] = "serialx_device";
+				char unit_property[] = "serialx_unit";
+				device_property[6] = '1' + i;
+				unit_property[6] = '1' + i;
+				const char *device = section->Get_string(device_property);
+				const int unit = section->Get_int(unit_property);
+				char native_port[320];
+				snprintf(native_port, sizeof(native_port), " realport:%s/%d",
+				         device && *device ? device : "serial.device", unit);
+				parameters += native_port;
+			}
+#endif
+			CommandLine cmd(0,parameters.c_str());
 			
 			// detect the type
 			if (type=="dummy") {

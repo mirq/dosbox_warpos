@@ -26,10 +26,13 @@
 #include <unistd.h>
 
 #include "dosbox.h"
+#ifndef __MORPHOS__
 #include "SDL.h"
+#endif
 #include "support.h"
 #include "cdrom.h"
 
+#ifndef __MORPHOS__
 CDROM_Interface_SDL::CDROM_Interface_SDL(void) {
 	driveID		= 0;
 	oldLeadOut	= 0;
@@ -143,37 +146,40 @@ bool CDROM_Interface_SDL::LoadUnloadMedia(bool unload) {
 	return success;
 }
 
+#endif /* !__MORPHOS__ */
+
 int CDROM_GetMountType(char* path, int forceCD) {
 // 0 - physical CDROM
-// 1 - Iso file
+// 1 - ISO/CUE file
 // 2 - subdirectory
-	// 1. Smells like a real cdrom 
-	// if ((strlen(path)<=3) && (path[2]=='\\') && (strchr(path,'\\')==strrchr(path,'\\')) && 	(GetDriveType(path)==DRIVE_CDROM)) return 0;
-
-	const char* cdName;
-	char buffer[512];
-	strcpy(buffer,path);
+#ifdef __MORPHOS__
+    (void)forceCD;
+    struct stat file_stat;
+    if (path && stat(path, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) return 1;
+    /* Native physical CDDA is deliberately not exposed until a trackdisk/
+       CAMD-compatible implementation is present. Directory mounts remain
+       fully usable and image mounts use CDROM_Interface_Image. */
+    return 2;
+#else
+    const char* cdName;
+    char buffer[512];
+    strcpy(buffer,path);
 #if defined (WIN32) || defined(OS2)
-	upcase(buffer);
+    upcase(buffer);
 #endif
-
-	int num = SDL_CDNumDrives();
-	// If cd drive is forced then check if its in range and return 0
-	if ((forceCD>=0) && (forceCD<num)) {
-		LOG(LOG_ALL,LOG_ERROR)("CDROM: Using drive %d",forceCD);
-		return 0;
-	}
-
-	// compare names
-	for (int i=0; i<num; i++) {
-		cdName = SDL_CDName(i);
-		if (strcmp(buffer,cdName)==0) return 0;
-	};
-	
-	// Detect ISO
-	struct stat file_stat;
-	if ((stat(path, &file_stat) == 0) && (file_stat.st_mode & S_IFREG)) return 1; 
-	return 2;
+    int num = SDL_CDNumDrives();
+    if ((forceCD>=0) && (forceCD<num)) {
+        LOG(LOG_ALL,LOG_ERROR)("CDROM: Using drive %d",forceCD);
+        return 0;
+    }
+    for (int i=0; i<num; i++) {
+        cdName = SDL_CDName(i);
+        if (strcmp(buffer,cdName)==0) return 0;
+    }
+    struct stat file_stat;
+    if ((stat(path, &file_stat) == 0) && (file_stat.st_mode & S_IFREG)) return 1;
+    return 2;
+#endif
 }
 
 // ******************************************************

@@ -417,6 +417,31 @@ public:
 
 static PCI* pci_interface=NULL;
 
+Bits PCI_RegisterDevice(PCI_Device *device, Bits slot) {
+	if (!device) return -1;
+	if (pci_interface) return pci_interface->RegisterPCIDevice(device, slot);
+	if (slot >= 0) return -1; /* queued devices are auto-assigned */
+	if (num_rqueued_devices >= max_rqueued_devices) return -1;
+	rqueued_devices[num_rqueued_devices++] = device;
+	return -2;
+}
+
+void PCI_RemoveDevice(Bit16u vendor_id, Bit16u device_id) {
+	if (pci_interface) {
+		pci_interface->RemoveDevice(vendor_id, device_id);
+		return;
+	}
+	for (Bitu i=0; i<num_rqueued_devices; ++i) {
+		PCI_Device *dev=rqueued_devices[i];
+		if (dev && dev->VendorID()==vendor_id && dev->DeviceID()==device_id) {
+			delete dev;
+			for (Bitu j=i+1; j<num_rqueued_devices; ++j)
+				rqueued_devices[j-1]=rqueued_devices[j];
+			--num_rqueued_devices;
+			break;
+		}
+	}
+}
 
 PhysPt PCI_GetPModeInterface(void) {
 	if (pci_interface) {

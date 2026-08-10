@@ -31,15 +31,37 @@
 #include "dosbox.h"
 #include "mem.h"
 #include "mixer.h"
+#ifdef __MORPHOS__
+#include "morphos_platform.h"
+#endif
+#ifndef __MORPHOS__
 #include "SDL.h"
 #include "SDL_thread.h"
+#endif
 
-#if defined(C_SDL_SOUND)
+#if defined(C_SDL_SOUND) && !defined(__MORPHOS__)
 #include "SDL_sound.h"
 #endif
 
 #define RAW_SECTOR_SIZE		2352
 #define COOKED_SECTOR_SIZE	2048
+
+#ifdef __MORPHOS__
+#ifndef CD_FPS
+#define CD_FPS 75
+#endif
+#ifndef FRAMES_TO_MSF
+#define FRAMES_TO_MSF(frames, M, S, F) do { \
+    int value__ = (int)(frames); \
+    *(F) = (unsigned char)(value__ % CD_FPS); value__ /= CD_FPS; \
+    *(S) = (unsigned char)(value__ % 60); value__ /= 60; \
+    *(M) = (unsigned char)value__; \
+} while (0)
+#endif
+#ifndef MSF_TO_FRAMES
+#define MSF_TO_FRAMES(M, S, F) ((int)(M) * 60 * CD_FPS + (int)(S) * CD_FPS + (int)(F))
+#endif
+#endif
 
 enum { CDROM_USE_SDL, CDROM_USE_ASPI, CDROM_USE_IOCTL_DIO, CDROM_USE_IOCTL_DX, CDROM_USE_IOCTL_MCI };
 
@@ -84,6 +106,7 @@ public:
 	virtual void	InitNewMedia		(void) {};
 };	
 
+#ifndef __MORPHOS__
 class CDROM_Interface_SDL : public CDROM_Interface
 {
 public:
@@ -112,6 +135,8 @@ private:
 	int		driveID;
 	Uint32	oldLeadOut;
 };
+
+#endif /* !__MORPHOS__ */
 
 class CDROM_Interface_Fake : public CDROM_Interface
 {
@@ -152,7 +177,7 @@ private:
 		std::ifstream *file;
 	};
 	
-	#if defined(C_SDL_SOUND)
+	#if defined(C_SDL_SOUND) && !defined(__MORPHOS__)
 	class AudioFile : public TrackFile {
 	public:
 		AudioFile(const char *filename, bool &error);
@@ -208,7 +233,11 @@ static	void	CDAudioCallBack(Bitu len);
 static  struct imagePlayer {
 		CDROM_Interface_Image *cd;
 		MixerChannel   *channel;
-		SDL_mutex 	*mutex;
+#ifdef __MORPHOS__
+		MorphOSMutex *mutex;
+#else
+		SDL_mutex *mutex;
+#endif
 		Bit8u   buffer[8192];
 		int     bufLen;
 		int     currFrame;	

@@ -56,7 +56,24 @@
 #define CACHE_TOTAL		(1024*1024*8)
 #define CACHE_PAGES		(512)
 #define CACHE_BLOCKS	(128*1024)
-#define CACHE_ALIGN		(16)
+/* MorphOS/PPC cache layout tuning.
+ *
+ * The G5 has a 64 KiB direct-mapped L1 instruction cache with 128-byte
+ * cache blocks.  Starting generated blocks at only 16-byte boundaries makes
+ * several independently generated blocks share an I-cache block and leaves
+ * the code-cache colour dependent on the address returned by AllocVecAligned.
+ * That produced large run-to-run performance differences on real G5 systems.
+ *
+ * G4 remains a separately buildable target with CPPFLAGS=-DG4. */
+#if defined(__MORPHOS__)
+# if defined(G4)
+#  define CACHE_ALIGN		(32)
+# else
+#  define CACHE_ALIGN		(128)
+# endif
+#else
+# define CACHE_ALIGN		(16)
+#endif
 #define DYN_HASH_SHIFT	(4)
 #define DYN_PAGE_HASH	(4096>>DYN_HASH_SHIFT)
 #define DYN_LINKS		(16)
@@ -130,6 +147,183 @@ static struct {
 	Bit32u protected_regs[8];	// space to save/restore register values
 } core_dynrec;
 
+/*
+ * Optional dynrec instrumentation.  The 64-bit fields are updated by the C++
+ * dispatcher/translator.  The 32-bit FPU fields are updated by generated PPC
+ * code only when -fpustats was enabled before the code cache was built.
+ */
+static struct DynrecStats {
+	bool jit_enabled;
+	bool fpu_enabled;
+	bool mem_enabled;
+	bool mem_fast_enabled;
+	bool mem_write_fast_enabled;
+	bool link_stats_enabled;
+	bool direct_links_enabled;
+	Bit64u cache_hits;
+	Bit64u cache_misses;
+	Bit64u dispatch_entries;
+	Bit64u blocks_created;
+	Bit64u instructions_translated;
+	Bit64u host_bytes_generated;
+	Bit64u zf_jcc_direct;
+	Bit64u zf_jcc_inline_producer;
+	Bit64u link_attempts;
+	Bit64u links_resolved;
+	Bit64u normal_fallbacks;
+	Bit64u opcode_fallbacks;
+	Bit64u smc_fallbacks;
+	Bit64u direct_link_sites;
+	Bit64u direct_links_patched;
+	Bit64u direct_links_invalidated;
+	Bit64u direct_links_out_of_range;
+	Bit64u cache_restarts;
+	Bitu cache_code_address;
+	Bitu cache_base_alignment;
+	Bitu cache_block_alignment;
+	Bit32u block_entries;
+	Bit32u fpu_instructions;
+	Bit32u fpu_fully_inlined;
+	Bit32u fpu_pop_ops;
+	Bit32u fpu_free_ops;
+	Bit32u fpu_store_ops;
+	Bit32u fpu_exchange_ops;
+	Bit32u fpu_sign_ops;
+	Bit32u fpu_top_ops;
+	Bit32u fpu_nop_ops;
+	Bit32u mem_read_fast_hits;
+	Bit32u mem_read_slow_tlb;
+	Bit32u mem_read_slow_unaligned;
+	Bit32u mem_read_slow_page_cross;
+	Bit32u mem_read_slow_other;
+	Bit32u mem_write_fast_hits;
+	Bit32u mem_write_slow_tlb;
+	Bit32u mem_write_slow_unaligned;
+	Bit32u mem_write_slow_page_cross;
+	Bit32u mem_write_slow_other;
+} dynrec_stats;
+
+void CPU_Dynrec_SetStats(bool jit_stats, bool fpu_stats, bool mem_stats, bool mem_fast,
+                         bool mem_write_fast, bool link_stats, bool direct_links)
+{
+	memset(&dynrec_stats, 0, sizeof(dynrec_stats));
+	dynrec_stats.jit_enabled = jit_stats;
+	dynrec_stats.fpu_enabled = fpu_stats;
+	dynrec_stats.mem_enabled = mem_stats;
+	dynrec_stats.mem_fast_enabled = mem_fast;
+	dynrec_stats.mem_write_fast_enabled = mem_write_fast;
+	dynrec_stats.link_stats_enabled = link_stats;
+	dynrec_stats.direct_links_enabled = direct_links;
+}
+
+void CPU_Dynrec_DumpStats(void)
+{
+	if (dynrec_stats.jit_enabled) {
+		const Bit64u lookups = dynrec_stats.cache_hits + dynrec_stats.cache_misses;
+		const double hit_rate = lookups ?
+		        (100.0 * (double)dynrec_stats.cache_hits / (double)lookups) : 0.0;
+		printf("DYNREC JIT statistics:\n");
+		printf("  Cache lookups: %llu, hits: %llu (%.2f%%), misses: %llu\n",
+		       (unsigned long long)lookups,
+		       (unsigned long long)dynrec_stats.cache_hits, hit_rate,
+		       (unsigned long long)dynrec_stats.cache_misses);
+		printf("  Dispatcher entries: %llu, generated block entries: %lu, "
+		       "translated blocks: %llu\n",
+		       (unsigned long long)dynrec_stats.dispatch_entries,
+		       (unsigned long)dynrec_stats.block_entries,
+		       (unsigned long long)dynrec_stats.blocks_created);
+		printf("  Guest instructions translated: %llu, host code bytes: %llu\n",
+		       (unsigned long long)dynrec_stats.instructions_translated,
+		       (unsigned long long)dynrec_stats.host_bytes_generated);
+		printf("  Direct CMP/TEST/logic + JZ/JNZ branches: %llu\n",
+		       (unsigned long long)dynrec_stats.zf_jcc_direct);
+		printf("  Inline CMP/TEST/logic producers (no helper): %llu\n",
+		       (unsigned long long)dynrec_stats.zf_jcc_inline_producer);
+		printf("  Links: %llu/%llu resolved, fallbacks normal/opcode/SMC: %llu/%llu/%llu\n",
+		       (unsigned long long)dynrec_stats.links_resolved,
+		       (unsigned long long)dynrec_stats.link_attempts,
+		       (unsigned long long)dynrec_stats.normal_fallbacks,
+		       (unsigned long long)dynrec_stats.opcode_fallbacks,
+		       (unsigned long long)dynrec_stats.smc_fallbacks);
+		printf("  Code cache: base=%p, base alignment=%lu, block alignment=%lu, restarts=%llu\n",
+		       (void *)dynrec_stats.cache_code_address,
+		       (unsigned long)dynrec_stats.cache_base_alignment,
+		       (unsigned long)dynrec_stats.cache_block_alignment,
+		       (unsigned long long)dynrec_stats.cache_restarts);
+	}
+
+	if (dynrec_stats.fpu_enabled) {
+		const Bit32u helper_backed = dynrec_stats.fpu_instructions -
+		                              dynrec_stats.fpu_fully_inlined;
+		printf("DYNREC FPU statistics (32-bit runtime counters):\n");
+		printf("  x87 instructions: %lu, fully inlined: %lu, helper-backed: %lu\n",
+		       (unsigned long)dynrec_stats.fpu_instructions,
+		       (unsigned long)dynrec_stats.fpu_fully_inlined,
+		       (unsigned long)helper_backed);
+		printf("  Inlined micro-ops pop/free/store/exchange/sign/top/nop: "
+		       "%lu/%lu/%lu/%lu/%lu/%lu/%lu\n",
+		       (unsigned long)dynrec_stats.fpu_pop_ops,
+		       (unsigned long)dynrec_stats.fpu_free_ops,
+		       (unsigned long)dynrec_stats.fpu_store_ops,
+		       (unsigned long)dynrec_stats.fpu_exchange_ops,
+		       (unsigned long)dynrec_stats.fpu_sign_ops,
+		       (unsigned long)dynrec_stats.fpu_top_ops,
+		       (unsigned long)dynrec_stats.fpu_nop_ops);
+	}
+
+	if (dynrec_stats.link_stats_enabled) {
+#if defined(G4)
+		const char *const tuning = "G4";
+#else
+		const char *const tuning = "G5";
+#endif
+		printf("DYNREC PPC direct-link statistics (%s tuning, direct links %s):\n",
+		       tuning,dynrec_stats.direct_links_enabled ? "enabled" : "disabled");
+		printf("  Emitted link sites: %llu, patched: %llu, invalidated: %llu\n",
+		       (unsigned long long)dynrec_stats.direct_link_sites,
+		       (unsigned long long)dynrec_stats.direct_links_patched,
+		       (unsigned long long)dynrec_stats.direct_links_invalidated);
+		printf("  Out-of-range/fallback patches: %llu\n",
+		       (unsigned long long)dynrec_stats.direct_links_out_of_range);
+	}
+
+	if (dynrec_stats.mem_enabled) {
+		const Bit64u read_slow = (Bit64u)dynrec_stats.mem_read_slow_tlb +
+		                         dynrec_stats.mem_read_slow_unaligned +
+		                         dynrec_stats.mem_read_slow_page_cross +
+		                         dynrec_stats.mem_read_slow_other;
+		const Bit64u read_total = (Bit64u)dynrec_stats.mem_read_fast_hits + read_slow;
+		const double read_hit_rate = read_total ?
+		        (100.0 * (double)dynrec_stats.mem_read_fast_hits / (double)read_total) : 0.0;
+		const Bit64u write_slow = (Bit64u)dynrec_stats.mem_write_slow_tlb +
+		                          dynrec_stats.mem_write_slow_unaligned +
+		                          dynrec_stats.mem_write_slow_page_cross +
+		                          dynrec_stats.mem_write_slow_other;
+		const Bit64u write_total = (Bit64u)dynrec_stats.mem_write_fast_hits + write_slow;
+		const double write_hit_rate = write_total ?
+		        (100.0 * (double)dynrec_stats.mem_write_fast_hits / (double)write_total) : 0.0;
+		printf("DYNREC PPC memory statistics (32-bit runtime counters, read/write fast paths %s/%s):\n",
+		       dynrec_stats.mem_fast_enabled ? "enabled" : "disabled",
+		       dynrec_stats.mem_write_fast_enabled ? "enabled" : "disabled");
+		printf("  Read fast hits: %lu of %llu (%.2f%%)\n",
+		       (unsigned long)dynrec_stats.mem_read_fast_hits,
+		       (unsigned long long)read_total, read_hit_rate);
+		printf("  Slow reads TLB/unaligned/page-cross/other: %lu/%lu/%lu/%lu\n",
+		       (unsigned long)dynrec_stats.mem_read_slow_tlb,
+		       (unsigned long)dynrec_stats.mem_read_slow_unaligned,
+		       (unsigned long)dynrec_stats.mem_read_slow_page_cross,
+		       (unsigned long)dynrec_stats.mem_read_slow_other);
+		printf("  Write fast hits: %lu of %llu (%.2f%%)\n",
+		       (unsigned long)dynrec_stats.mem_write_fast_hits,
+		       (unsigned long long)write_total, write_hit_rate);
+		printf("  Slow writes TLB/unaligned/page-cross/other: %lu/%lu/%lu/%lu\n",
+		       (unsigned long)dynrec_stats.mem_write_slow_tlb,
+		       (unsigned long)dynrec_stats.mem_write_slow_unaligned,
+		       (unsigned long)dynrec_stats.mem_write_slow_page_cross,
+		       (unsigned long)dynrec_stats.mem_write_slow_other);
+	}
+}
+
 
 #include "core_dynrec/cache.h"
 
@@ -160,10 +354,19 @@ static struct {
 #define gen_mov_LE_word_to_reg gen_mov_word_to_reg
 #endif
 
+#if defined(__MORPHOS__)
+/* Static process storage for the 8 MiB PPC JIT cache.  Placing the
+ * arena immediately before decoder.h keeps generated code and dynrec
+ * helpers in the same executable text hunk. */
+Bit8u ppc_jit_storage[CACHE_TOTAL + CACHE_MAXSIZE + 65536]
+        __attribute__((section(".text"), aligned(65536), used));
+#endif
+
 #include "core_dynrec/decoder.h"
 
 CacheBlockDynRec * LinkBlocks(BlockReturn ret) {
 	CacheBlockDynRec * block=NULL;
+	if (dynrec_stats.jit_enabled) dynrec_stats.link_attempts++;
 	// the last instruction was a control flow modifying instruction
 	Bitu temp_ip=SegPhys(cs)+reg_eip;
 	CodePageHandlerDynRec * temp_handler=(CodePageHandlerDynRec *)get_tlb_readhandler(temp_ip);
@@ -171,6 +374,7 @@ CacheBlockDynRec * LinkBlocks(BlockReturn ret) {
 		// see if the target is an already translated block
 		block=temp_handler->FindCacheBlock(temp_ip & 4095);
 		if (block) { // found it, link the current block to
+			if (dynrec_stats.jit_enabled) dynrec_stats.links_resolved++;
 			cache.block.running->LinkTo(ret==BR_Link2,block);
 		}
 	}
@@ -206,10 +410,17 @@ Bits CPU_Core_Dynrec_Run(void) {
 		}
 
 		// page doesn't contain code or is special
-		if (GCC_UNLIKELY(!chandler)) return CPU_Core_Normal_Run();
+		if (GCC_UNLIKELY(!chandler)) {
+			if (dynrec_stats.jit_enabled) dynrec_stats.normal_fallbacks++;
+			return CPU_Core_Normal_Run();
+		}
 
 		// find correct Dynamic Block to run
 		CacheBlockDynRec * block=chandler->FindCacheBlock(ip_point&4095);
+		if (dynrec_stats.jit_enabled) {
+			if (block) dynrec_stats.cache_hits++;
+			else dynrec_stats.cache_misses++;
+		}
 		if (!block) {
 			// no block found, thus translate the instruction stream
 			// unless the instruction is known to be modified
@@ -232,6 +443,7 @@ Bits CPU_Core_Dynrec_Run(void) {
 
 run_block:
 		cache.block.running=0;
+		if (dynrec_stats.jit_enabled) dynrec_stats.dispatch_entries++;
 		// now we're ready to run the dynamic code block
 		//BlockReturn ret=((BlockReturn (*)(void))(block->cache.start))();
      	BlockReturn ret=core_dynrec.runcode(block->cache.start);
@@ -252,6 +464,7 @@ run_block:
 			return CBRET_NONE;
 
 		case BR_Normal:
+			if (dynrec_stats.jit_enabled) dynrec_stats.normal_fallbacks++;
 			// the block was exited due to a non-predictable control flow
 			// modifying instruction (like ret) or some nontrivial cpu state
 			// changing instruction (for example switch to/from pmode),
@@ -280,9 +493,11 @@ run_block:
 
 		case BR_SMCBlock:
 //			LOG_MSG("selfmodification of running block at %x:%x",SegValue(cs),reg_eip);
+			if (dynrec_stats.jit_enabled) dynrec_stats.smc_fallbacks++;
 			cpu.exception.which=0;
 			// fallthrough, let the normal core handle the block-modifying instruction
 		case BR_Opcode:
+			if (dynrec_stats.jit_enabled) dynrec_stats.opcode_fallbacks++;
 			// some instruction has been encountered that could not be translated
 			// (thus it is not part of the code block), the normal core will
 			// handle this instruction

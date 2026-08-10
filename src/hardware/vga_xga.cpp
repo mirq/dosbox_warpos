@@ -25,6 +25,10 @@
 #include <stdio.h>
 #include "callback.h"
 #include "cpu.h"		// for 0x3da delay
+#ifdef __MORPHOS__
+#include "morphos_altivec.h"
+#include "morphos_runtime.h"
+#endif
 
 #define XGA_SCREEN_WIDTH	vga.s3.xga_screen_width
 #define XGA_COLOR_MODE		vga.s3.xga_color_mode
@@ -41,6 +45,8 @@ struct XGAStatus {
 
 	Bit32u forecolor;
 	Bit32u backcolor;
+
+	Bit32u color_compare;
 
 	Bitu curcommand;
 
@@ -70,9 +76,12 @@ struct XGAStatus {
 		Bitu buswidth;
 	} waitcmd;
 
-} xga;
+};
 
-void XGA_Write_Multifunc(Bitu val, Bitu len) {
+static XGAStatus xga;
+
+static void XGA_Write_Multifunc(Bitu val, Bitu len) {
+	(void)len;
 	Bitu regselect = val >> 12;
 	Bitu dataval = val & 0xfff;
 	switch(regselect) {
@@ -109,7 +118,7 @@ void XGA_Write_Multifunc(Bitu val, Bitu len) {
 	}
 }
 
-Bitu XGA_Read_Multifunc() {
+static Bitu XGA_Read_Multifunc() {
 	switch(xga.read_sel++) {
 		case 0: return xga.MIPcount;
 		case 1: return xga.scissors.y1;
@@ -127,9 +136,8 @@ Bitu XGA_Read_Multifunc() {
 }
 
 
-void XGA_DrawPoint(Bitu x, Bitu y, Bitu c) {
-	if(!(xga.curcommand & 0x1)) return;
-	if(!(xga.curcommand & 0x10)) return;
+static void XGA_DrawPoint(Bitu x, Bitu y, Bitu c) {
+	if((xga.curcommand & 0x11) != 0x11) return;
 
 	if(x < xga.scissors.x1) return;
 	if(x > xga.scissors.x2) return;
@@ -163,7 +171,7 @@ void XGA_DrawPoint(Bitu x, Bitu y, Bitu c) {
 
 }
 
-Bitu XGA_GetPoint(Bitu x, Bitu y) {
+static Bitu XGA_GetPoint(Bitu x, Bitu y) {
 	Bit32u memaddr = (y * XGA_SCREEN_WIDTH) + x;
 
 	switch(XGA_COLOR_MODE) {
@@ -184,69 +192,356 @@ Bitu XGA_GetPoint(Bitu x, Bitu y) {
 }
 
 
-Bitu XGA_GetMixResult(Bitu mixmode, Bitu srcval, Bitu dstdata) {
-	Bitu destval = 0;
-	switch(mixmode &  0xf) {
+/* Resolve the raster operation and fetch the destination pixel only for
+ * operations that actually use it. This preserves the exact ROP result while
+ * avoiding a VRAM read for FALSE, TRUE, NOT SRC and SRC. */
+static Bitu XGA_GetMixResult(Bitu mixmode, Bitu srcval, Bitu x, Bitu y) {
+	switch(mixmode & 0xf) {
 		case 0x00: /* not DST */
-			destval = ~dstdata;
-			break;
+			return ~XGA_GetPoint(x, y);
 		case 0x01: /* 0 (false) */
-			destval = 0;
-			break;
+			return 0;
 		case 0x02: /* 1 (true) */
-			destval = 0xffffffff;
-			break;
-		case 0x03: /* 2 DST */
-			destval = dstdata;
-			break;
+			return 0xffffffff;
+		case 0x03: /* DST */
+			return XGA_GetPoint(x, y);
 		case 0x04: /* not SRC */
-			destval = ~srcval;
-			break;
+			return ~srcval;
 		case 0x05: /* SRC xor DST */
-			destval = srcval ^ dstdata;
-			break;
+			return srcval ^ XGA_GetPoint(x, y);
 		case 0x06: /* not (SRC xor DST) */
-			destval = ~(srcval ^ dstdata);
-			break;
+			return ~(srcval ^ XGA_GetPoint(x, y));
 		case 0x07: /* SRC */
-			destval = srcval;
-			break;
+			return srcval;
 		case 0x08: /* not (SRC and DST) */
-			destval = ~(srcval & dstdata);
-			break;
+			return ~(srcval & XGA_GetPoint(x, y));
 		case 0x09: /* (not SRC) or DST */
-			destval = (~srcval) | dstdata;
-			break;
+			return (~srcval) | XGA_GetPoint(x, y);
 		case 0x0a: /* SRC or (not DST) */
-			destval = srcval | (~dstdata);
-			break;
+			return srcval | (~XGA_GetPoint(x, y));
 		case 0x0b: /* SRC or DST */
-			destval = srcval | dstdata;
-			break;
+			return srcval | XGA_GetPoint(x, y);
 		case 0x0c: /* SRC and DST */
-			destval = srcval & dstdata;
-			break;
+			return srcval & XGA_GetPoint(x, y);
 		case 0x0d: /* SRC and (not DST) */
-			destval = srcval & (~dstdata);
-			break;
+			return srcval & (~XGA_GetPoint(x, y));
 		case 0x0e: /* (not SRC) and DST */
-			destval = (~srcval) & dstdata;
-			break;
+			return (~srcval) & XGA_GetPoint(x, y);
 		case 0x0f: /* not (SRC or DST) */
-			destval = ~(srcval | dstdata);
-			break;
+			return ~(srcval | XGA_GetPoint(x, y));
 		default:
 			LOG_MSG("XGA: GetMixResult: Unknown mix.  Shouldn't be able to get here!");
-			break;
+			return 0;
 	}
-	return destval;
 }
 
-void XGA_DrawLineVector(Bitu val) {
+static inline void XGA_DrawMixedPoint(Bitu x, Bitu y, Bitu mixmode, Bitu srcval) {
+	XGA_DrawPoint(x, y, XGA_GetMixResult(mixmode, srcval, x, y));
+}
+
+static inline bool XGA_ColorCompareAllows(Bitu srcval, Bitu colorcmpdata,
+                                          bool enabled, bool src_ne) {
+	return !enabled || ((srcval != colorcmpdata) != src_ne);
+}
+
+#ifdef __MORPHOS__
+static bool XGA_HasUsableAltiVec(void) {
+	static int tested = 0;
+	static bool usable = false;
+	if(!tested) {
+		usable = MORPHOS_HasAltiVec() && MORPHOS_AltivecSelfTest();
+		tested = 1;
+	}
+	return usable;
+}
+#endif
+
+
+/* Return true only when an 8-bit destination rectangle can be written as
+ * complete rows without changing clipping or out-of-range behavior. The
+ * normal pixel path remains responsible for every irregular case. */
+static bool XGA_GetFastDestRect8(Bits startx, Bits starty, Bits dx, Bits dy,
+                                 Bit32u width, Bit32u height,
+                                 Bit32u &left, Bit32u &top) {
+	if(XGA_COLOR_MODE != M_LIN8 || (xga.curcommand & 0x11) != 0x11 ||
+	   XGA_SCREEN_WIDTH == 0 || width == 0 || height == 0)
+		return false;
+
+	const Bits xlast = startx + dx * (Bits)(width - 1);
+	const Bits ylast = starty + dy * (Bits)(height - 1);
+	const Bits xlo = (startx < xlast) ? startx : xlast;
+	const Bits xhi = (startx > xlast) ? startx : xlast;
+	const Bits ylo = (starty < ylast) ? starty : ylast;
+	const Bits yhi = (starty > ylast) ? starty : ylast;
+
+	if(xlo < 0 || ylo < 0 || xhi < xlo || yhi < ylo)
+		return false;
+	if((Bitu)xhi >= XGA_SCREEN_WIDTH)
+		return false;
+	if((Bitu)xlo < xga.scissors.x1 || (Bitu)xhi > xga.scissors.x2 ||
+	   (Bitu)ylo < xga.scissors.y1 || (Bitu)yhi > xga.scissors.y2)
+		return false;
+
+	const Bit32u first = (Bit32u)ylo * (Bit32u)XGA_SCREEN_WIDTH + (Bit32u)xlo;
+	const Bit32u last = (Bit32u)yhi * (Bit32u)XGA_SCREEN_WIDTH + (Bit32u)xhi;
+	if(first >= vga.vmemsize || last >= vga.vmemsize)
+		return false;
+
+	left = (Bit32u)xlo;
+	top = (Bit32u)ylo;
+	return true;
+}
+
+static bool XGA_TryFastSolidFill8(Bits startx, Bits starty, Bits dx, Bits dy,
+                                  Bit32u width, Bit32u height, Bitu srcval) {
+	Bit32u left, top;
+	if(!XGA_GetFastDestRect8(startx, starty, dx, dy,
+	                         width, height, left, top))
+		return false;
+
+	Bit8u *row = vga.mem.linear + top * (Bit32u)XGA_SCREEN_WIDTH + left;
+	for(Bit32u y = 0; y < height; ++y) {
+		memset(row, (int)(srcval & 0xffu), width);
+		row += XGA_SCREEN_WIDTH;
+	}
+	return true;
+}
+
+/* Fast VRAM-to-VRAM copy used by the common 8-bit ROP=SRC command. It is
+ * deliberately limited to fully visible, in-range and non-overlapping
+ * rectangles. Overlapping or unusual commands retain the original ordered
+ * pixel loop, so guest-selected copy direction keeps its exact behavior. */
+static bool XGA_TryFastBitmapCopy8(Bits dx, Bits dy, Bit32u colorcmpdata,
+                                   bool color_cmp_enabled,
+                                   bool color_cmp_src_ne) {
+	const Bit32u width = (Bit32u)xga.MAPcount + 1u;
+	const Bit32u height = (Bit32u)xga.MIPcount + 1u;
+	Bit32u src_left, src_top, dst_left, dst_top;
+
+	if(!XGA_GetFastDestRect8(xga.destx, xga.desty, dx, dy,
+	                         width, height, dst_left, dst_top))
+		return false;
+
+	/* Source pixels are not clipped, but they must be valid contiguous rows. */
+	if(XGA_COLOR_MODE != M_LIN8 || XGA_SCREEN_WIDTH == 0)
+		return false;
+	const Bits src_last_x = (Bits)xga.curx + dx * (Bits)(width - 1u);
+	const Bits src_last_y = (Bits)xga.cury + dy * (Bits)(height - 1u);
+	const Bits src_xlo = ((Bits)xga.curx < src_last_x) ? (Bits)xga.curx : src_last_x;
+	const Bits src_xhi = ((Bits)xga.curx > src_last_x) ? (Bits)xga.curx : src_last_x;
+	const Bits src_ylo = ((Bits)xga.cury < src_last_y) ? (Bits)xga.cury : src_last_y;
+	const Bits src_yhi = ((Bits)xga.cury > src_last_y) ? (Bits)xga.cury : src_last_y;
+	if(src_xlo < 0 || src_ylo < 0 || src_xhi < src_xlo || src_yhi < src_ylo ||
+	   (Bitu)src_xhi >= XGA_SCREEN_WIDTH)
+		return false;
+
+	src_left = (Bit32u)src_xlo;
+	src_top = (Bit32u)src_ylo;
+	const Bit32u src_first = src_top * (Bit32u)XGA_SCREEN_WIDTH + src_left;
+	const Bit32u src_last = (Bit32u)src_yhi * (Bit32u)XGA_SCREEN_WIDTH +
+	                       (Bit32u)src_xhi;
+	const Bit32u dst_first = dst_top * (Bit32u)XGA_SCREEN_WIDTH + dst_left;
+	const Bit32u dst_last = (dst_top + height - 1u) * (Bit32u)XGA_SCREEN_WIDTH +
+	                       (dst_left + width - 1u);
+	if(src_first >= vga.vmemsize || src_last >= vga.vmemsize)
+		return false;
+
+	/* Conservative whole-rectangle overlap check. False positives only select
+	 * the old path; no overlapping command reaches memcpy. */
+	if(!(src_last < dst_first || dst_last < src_first))
+		return false;
+
+	const Bit8u cmp = (Bit8u)colorcmpdata;
+	const Bit8u *first_src = vga.mem.linear +
+	                         src_top * (Bit32u)XGA_SCREEN_WIDTH + src_left;
+	Bit8u *first_dst = vga.mem.linear +
+	                   dst_top * (Bit32u)XGA_SCREEN_WIDTH + dst_left;
+
+#ifdef __MORPHOS__
+	/* A color-keyed row is a compare/select operation, which maps directly to
+	 * AltiVec. Keep memcpy for opaque copies and use VMX only when the row is
+	 * wide enough to amortize the call and both pointers can be aligned by the
+	 * same scalar prefix. Every other case retains the scalar implementation. */
+	if(color_cmp_enabled && width >= 64u && XGA_HasUsableAltiVec() &&
+	   ((((IPTR)first_src ^ (IPTR)first_dst) & 15u) == 0u)) {
+		MORPHOS_AltivecColorKeyCopy8Rows(first_src, first_dst,
+		                                     width, height,
+		                                     (ULONG)XGA_SCREEN_WIDTH,
+		                                     cmp,
+		                                     color_cmp_src_ne ? TRUE : FALSE);
+		return true;
+	}
+#endif
+
+	for(Bit32u y = 0; y < height; ++y) {
+		const Bit8u *src = first_src + y * (Bit32u)XGA_SCREEN_WIDTH;
+		Bit8u *dst = first_dst + y * (Bit32u)XGA_SCREEN_WIDTH;
+		if(!color_cmp_enabled) {
+			memcpy(dst, src, width);
+		} else if(!color_cmp_src_ne) {
+			/* SRC_NE clear: equal pixels are transparent. */
+			for(Bit32u x = 0; x < width; ++x)
+				if(src[x] != cmp) dst[x] = src[x];
+		} else {
+			/* SRC_NE set: non-equal pixels are transparent. */
+			for(Bit32u x = 0; x < width; ++x)
+				if(src[x] == cmp) dst[x] = src[x];
+		}
+	}
+	return true;
+}
+
+/* Fast path for the common rectangle-fill form where FOREMIX and its solid
+ * source color remain constant for the entire synchronous command. */
+static void XGA_DrawSolidRectangle(Bits dx, Bits dy, Bitu mixmode, Bitu srcval) {
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+	Bits srcy = xga.cury;
+	Bits srcx = xga.curx;
+
+	/* ROP DST leaves every destination pixel unchanged. Rectangle commands
+	 * still update CUR_X/CUR_Y, so reproduce only that final state. */
+	if((mixmode & 0x0f) == 0x03) {
+		xga.curx = (Bit16u)(srcx + dx * (Bits)(width + 1));
+		xga.cury = (Bit16u)(srcy + dy * (Bits)(height + 1));
+		return;
+	}
+
+	/* ROP SRC is a direct solid fill and does not need the ROP mixer. */
+	if((mixmode & 0x0f) == 0x07) {
+		if(!XGA_TryFastSolidFill8(xga.curx, xga.cury, dx, dy,
+		                             width + 1u, height + 1u, srcval)) {
+			for(Bit32u yat = 0; yat <= height; ++yat) {
+				srcx = xga.curx;
+				for(Bit32u xat = 0; xat <= width; ++xat) {
+					XGA_DrawPoint(srcx, srcy, srcval);
+					srcx += dx;
+				}
+				srcy += dy;
+			}
+		} else {
+			srcx = (Bits)xga.curx + dx * (Bits)(width + 1u);
+			srcy = (Bits)xga.cury + dy * (Bits)(height + 1u);
+		}
+		xga.curx = (Bit16u)srcx;
+		xga.cury = (Bit16u)srcy;
+		return;
+	}
+
+	for(Bit32u yat = 0; yat <= height; ++yat) {
+		srcx = xga.curx;
+		for(Bit32u xat = 0; xat <= width; ++xat) {
+			XGA_DrawMixedPoint(srcx, srcy, mixmode, srcval);
+			srcx += dx;
+		}
+		srcy += dy;
+	}
+
+	xga.curx = (Bit16u)srcx;
+	xga.cury = (Bit16u)srcy;
+}
+
+static inline void XGA_BlitWritePixel(Bitu tarx, Bitu tary, Bitu mixmode,
+                                      Bitu srcval, Bitu colorcmpdata,
+                                      bool color_cmp_enabled,
+                                      bool color_cmp_src_ne) {
+	if(XGA_ColorCompareAllows(srcval, colorcmpdata,
+	                          color_cmp_enabled, color_cmp_src_ne))
+		XGA_DrawMixedPoint(tarx, tary, mixmode, srcval);
+}
+
+static void XGA_BlitRectConstantSource(Bits dx, Bits dy, Bitu mixmode,
+                                       Bitu srcval, Bitu colorcmpdata,
+                                       bool color_cmp_enabled,
+                                       bool color_cmp_src_ne) {
+	/* ROP DST is a complete no-op for BitBLT. A constant source also has one
+	 * COLOR_CMP result for the whole command, so evaluate it once. */
+	if((mixmode & 0x0f) == 0x03 ||
+	   !XGA_ColorCompareAllows(srcval, colorcmpdata,
+	                           color_cmp_enabled, color_cmp_src_ne))
+		return;
+
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+	Bits tary = xga.desty;
+
+	if((mixmode & 0x0f) == 0x07) {
+		if(XGA_TryFastSolidFill8(xga.destx, xga.desty, dx, dy,
+		                            width + 1u, height + 1u, srcval))
+			return;
+		for(Bit32u yat = 0; yat <= height; ++yat) {
+			Bits tarx = xga.destx;
+			for(Bit32u xat = 0; xat <= width; ++xat) {
+				XGA_DrawPoint(tarx, tary, srcval);
+				tarx += dx;
+			}
+			tary += dy;
+		}
+		return;
+	}
+
+	for(Bit32u yat = 0; yat <= height; ++yat) {
+		Bits tarx = xga.destx;
+		for(Bit32u xat = 0; xat <= width; ++xat) {
+			XGA_DrawMixedPoint(tarx, tary, mixmode, srcval);
+			tarx += dx;
+		}
+		tary += dy;
+	}
+}
+
+static void XGA_BlitRectBitmapSource(Bits dx, Bits dy, Bitu mixmode,
+                                     Bitu colorcmpdata,
+                                     bool color_cmp_enabled,
+                                     bool color_cmp_src_ne) {
+	/* ROP DST neither reads nor changes externally visible S3 state. */
+	if((mixmode & 0x0f) == 0x03)
+		return;
+
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+	Bits srcy = xga.cury;
+	Bits tary = xga.desty;
+
+	if((mixmode & 0x0f) == 0x07) {
+		if(XGA_TryFastBitmapCopy8(dx, dy, colorcmpdata,
+		                              color_cmp_enabled, color_cmp_src_ne))
+			return;
+		for(Bit32u yat = 0; yat <= height; ++yat) {
+			Bits srcx = xga.curx;
+			Bits tarx = xga.destx;
+			for(Bit32u xat = 0; xat <= width; ++xat) {
+				const Bitu srcval = XGA_GetPoint(srcx, srcy);
+				if(XGA_ColorCompareAllows(srcval, colorcmpdata,
+				                          color_cmp_enabled, color_cmp_src_ne))
+					XGA_DrawPoint(tarx, tary, srcval);
+				srcx += dx;
+				tarx += dx;
+			}
+			srcy += dy;
+			tary += dy;
+		}
+		return;
+	}
+
+	for(Bit32u yat = 0; yat <= height; ++yat) {
+		Bits srcx = xga.curx;
+		Bits tarx = xga.destx;
+		for(Bit32u xat = 0; xat <= width; ++xat) {
+			const Bitu srcval = XGA_GetPoint(srcx, srcy);
+			XGA_BlitWritePixel(tarx, tary, mixmode, srcval, colorcmpdata,
+			                   color_cmp_enabled, color_cmp_src_ne);
+			srcx += dx;
+			tarx += dx;
+		}
+		srcy += dy;
+		tary += dy;
+	}
+}
+
+static void XGA_DrawLineVector(Bitu val) {
 	Bits xat, yat;
-	Bitu srcval;
-	Bitu destval;
-	Bitu dstdata;
+	Bitu srcval = 0;
 	Bits i;
 
 	Bits dx, sx, sy;
@@ -318,11 +613,7 @@ void XGA_DrawLineVector(Bitu val) {
 						LOG_MSG("XGA: DrawRect: Shouldn't be able to get here!");
 						break;
 				}
-				dstdata = XGA_GetPoint(xat,yat);
-
-				destval = XGA_GetMixResult(mixmode, srcval, dstdata);
-
-                XGA_DrawPoint(xat,yat, destval);
+				XGA_DrawMixedPoint(xat, yat, mixmode, srcval);
 				break;
 			default: 
 				LOG_MSG("XGA: DrawLine: Needs mixmode %x", mixmode);
@@ -336,11 +627,10 @@ void XGA_DrawLineVector(Bitu val) {
 	xga.cury = yat;
 }
 
-void XGA_DrawLineBresenham(Bitu val) {
+static void XGA_DrawLineBresenham(Bitu val) {
 	Bits xat, yat;
-	Bitu srcval;
+	Bitu srcval = 0;
 	Bitu destval;
-	Bitu dstdata;
 	Bits i;
 	Bits tmpswap;
 	bool steep;
@@ -388,7 +678,8 @@ void XGA_DrawLineBresenham(Bitu val) {
     
 	//LOG_MSG("XGA: Bresenham: ASC %d, LPDSC %d, sx %d, sy %d, err %d, steep %d, length %d, dmajor %d, dminor %d, xstart %d, ystart %d", dx, dy, sx, sy, e, steep, xga.MAPcount, dmajor, dminor,xat,yat);
 
-	for (i=0;i<=xga.MAPcount;i++) { 
+	const Bits pixel_count = xga.MAPcount;
+	for (i=0;i<=pixel_count;i++) { 
 			Bitu mixmode = (xga.pix_cntl >> 6) & 0x3;
 			switch (mixmode) {
 				case 0x00: /* FOREMIX always used */
@@ -414,16 +705,10 @@ void XGA_DrawLineBresenham(Bitu val) {
 					}
 
 					if(steep) {
-						dstdata = XGA_GetPoint(xat,yat);
-					} else {
-						dstdata = XGA_GetPoint(yat,xat);
-					}
-
-					destval = XGA_GetMixResult(mixmode, srcval, dstdata);
-
-					if(steep) {
+						destval = XGA_GetMixResult(mixmode, srcval, xat, yat);
 						XGA_DrawPoint(xat,yat, destval);
 					} else {
+						destval = XGA_GetMixResult(mixmode, srcval, yat, xat);
 						XGA_DrawPoint(yat,xat, destval);
 					}
 
@@ -452,11 +737,9 @@ void XGA_DrawLineBresenham(Bitu val) {
 	
 }
 
-void XGA_DrawRectangle(Bitu val) {
+static void XGA_DrawRectangle(Bitu val) {
 	Bit32u xat, yat;
-	Bitu srcval;
-	Bitu destval;
-	Bitu dstdata;
+	Bitu srcval = 0;
 
 	Bits srcx, srcy, dx, dy;
 
@@ -466,11 +749,29 @@ void XGA_DrawRectangle(Bitu val) {
 	if(((val >> 5) & 0x01) != 0) dx = 1;
 	if(((val >> 7) & 0x01) != 0) dy = 1;
 
-	srcy = xga.cury;
+	/* The supported rectangle-fill path uses a single, fixed FOREMIX. Decode
+	 * its solid source once instead of once per destination pixel. */
+	if(((xga.pix_cntl >> 6) & 0x3) == 0) {
+		const Bitu fixed_mixmode = xga.foremix;
+		switch((fixed_mixmode >> 5) & 0x03) {
+			case 0x00:
+				XGA_DrawSolidRectangle(dx, dy, fixed_mixmode, xga.backcolor);
+				return;
+			case 0x01:
+				XGA_DrawSolidRectangle(dx, dy, fixed_mixmode, xga.forecolor);
+				return;
+			default:
+				break; /* preserve the original diagnostic/fallback path */
+		}
+	}
 
-	for(yat=0;yat<=xga.MIPcount;yat++) {
+	srcy = xga.cury;
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+
+	for(yat=0;yat<=height;yat++) {
 		srcx = xga.curx;
-		for(xat=0;xat<=xga.MAPcount;xat++) {
+		for(xat=0;xat<=width;xat++) {
 			Bitu mixmode = (xga.pix_cntl >> 6) & 0x3;
 			switch (mixmode) {
 				case 0x00: /* FOREMIX always used */
@@ -494,11 +795,7 @@ void XGA_DrawRectangle(Bitu val) {
 							LOG_MSG("XGA: DrawRect: Shouldn't be able to get here!");
 							break;
 					}
-					dstdata = XGA_GetPoint(srcx,srcy);
-
-					destval = XGA_GetMixResult(mixmode, srcval, dstdata);
-
-                    XGA_DrawPoint(srcx,srcy, destval);
+					XGA_DrawMixedPoint(srcx, srcy, mixmode, srcval);
 					break;
 				default: 
 					LOG_MSG("XGA: DrawRect: Needs mixmode %x", mixmode);
@@ -514,7 +811,7 @@ void XGA_DrawRectangle(Bitu val) {
 	//LOG_MSG("XGA: Draw rect (%d, %d)-(%d, %d), %d", x1, y1, x2, y2, xga.forecolor);
 }
 
-bool XGA_CheckX(void) {
+static bool XGA_CheckX(void) {
 	bool newline = false;
 	if(!xga.waitcmd.newline) {
 	
@@ -557,21 +854,55 @@ bool XGA_CheckX(void) {
 	return newline;
 }
 
-void XGA_DrawWaitSub(Bitu mixmode, Bitu srcval) {
-	Bitu destval;
-	Bitu dstdata;
-	dstdata = XGA_GetPoint(xga.waitcmd.curx, xga.waitcmd.cury);
-	destval = XGA_GetMixResult(mixmode, srcval, dstdata);
-	//LOG_MSG("XGA: DrawPattern: Mixmode: %x srcval: %x", mixmode, srcval);
-
-	XGA_DrawPoint(xga.waitcmd.curx, xga.waitcmd.cury, destval);
+static inline void XGA_AdvanceWaitPixel(void) {
 	xga.waitcmd.curx++;
-	xga.waitcmd.curx&=0x0fff;
+	xga.waitcmd.curx &= 0x0fff;
 	XGA_CheckX();
 }
 
-void XGA_DrawWait(Bitu val, Bitu len) {
-	if(!xga.waitcmd.wait) return;
+/* The PIX_TRANS path is dominated by plain source copies. Handle the two
+ * identity ROPs before the generic mixer: SRC does not need a destination
+ * read, while DST does not need a VRAM access at all. */
+static void XGA_DrawWaitSub(Bitu mixmode, Bitu srcval) {
+	const Bitu rop = mixmode & 0x0f;
+
+	if(GCC_LIKELY(rop == 0x07)) { /* SRC */
+		if(XGA_COLOR_MODE == M_LIN8) {
+			const Bitu x = xga.waitcmd.curx;
+			const Bitu y = xga.waitcmd.cury;
+			if(GCC_LIKELY((xga.curcommand & 0x11) == 0x11) &&
+			   GCC_LIKELY(x >= xga.scissors.x1 && x <= xga.scissors.x2) &&
+			   GCC_LIKELY(y >= xga.scissors.y1 && y <= xga.scissors.y2)) {
+				const Bit32u memaddr = (y * XGA_SCREEN_WIDTH) + x;
+				if(GCC_LIKELY(memaddr < vga.vmemsize))
+					vga.mem.linear[memaddr] = (Bit8u)srcval;
+			}
+		} else {
+			XGA_DrawPoint(xga.waitcmd.curx, xga.waitcmd.cury, srcval);
+		}
+		XGA_AdvanceWaitPixel();
+		return;
+	}
+
+	if(GCC_UNLIKELY(rop == 0x03) && XGA_COLOR_MODE != M_LIN15) {
+		/* In 15-bit mode the legacy read/write pair also clears bit 15. */
+		XGA_AdvanceWaitPixel();
+		return;
+	}
+
+	XGA_DrawMixedPoint(xga.waitcmd.curx, xga.waitcmd.cury, mixmode, srcval);
+	XGA_AdvanceWaitPixel();
+}
+
+static inline void XGA_DrawWaitFour8(Bitu mixmode, Bitu val) {
+	XGA_DrawWaitSub(mixmode,  val        & 0xffu);
+	XGA_DrawWaitSub(mixmode, (val >>  8) & 0xffu);
+	XGA_DrawWaitSub(mixmode, (val >> 16) & 0xffu);
+	XGA_DrawWaitSub(mixmode, (val >> 24) & 0xffu);
+}
+
+static void XGA_DrawWait(Bitu val, Bitu len) {
+	if(GCC_UNLIKELY(!xga.waitcmd.wait)) return;
 	Bitu mixmode = (xga.pix_cntl >> 6) & 0x3;
 	Bitu srcval;
 	switch(xga.waitcmd.cmd) {
@@ -605,8 +936,7 @@ void XGA_DrawWait(Bitu val, Bitu len) {
 							}
 							break;
 						case 0x40 | M_LIN8: // 32 bit
-                            for(int i = 0; i < 4; i++)
-								XGA_DrawWaitSub(mixmode, (val>>(8*i))&0xff);
+							XGA_DrawWaitFour8(mixmode, val);
 							break;
 						case (0x20 | M_LIN32):
 							if(len!=4) { // Win 3.11 864 'hack?'
@@ -644,9 +974,9 @@ void XGA_DrawWait(Bitu val, Bitu len) {
 					};
 					break;
 			
-				case 0x02: // Data from PIX_TRANS selects the mix
-					Bitu chunksize;
-					Bitu chunks;
+				case 0x02: { // Data from PIX_TRANS selects the mix
+					Bitu chunksize = 0;
+					Bitu chunks = 0;
 					switch(xga.waitcmd.buswidth&0x60) {
 						case 0x0:
 							chunksize=8;
@@ -661,37 +991,50 @@ void XGA_DrawWait(Bitu val, Bitu len) {
 							chunksize=16;
 							if(len==4) chunks=2;
 							else chunks = 1;
-                           	break;
+							break;
 						case 0x60: // undocumented guess (but works)
 							chunksize=8;
 							chunks=4;
 							break;
+						default:
+							break;
 					}
+
+					const Bitu foremix = xga.foremix;
+					const Bitu backmix = xga.backmix;
+					const Bitu foresrcsel = (foremix >> 5) & 0x03;
+					const Bitu backsrcsel = (backmix >> 5) & 0x03;
+					const bool decoded_sources = (foresrcsel <= 1 && backsrcsel <= 1);
+					const Bitu foresrc = foresrcsel ? xga.forecolor : xga.backcolor;
+					const Bitu backsrc = backsrcsel ? xga.forecolor : xga.backcolor;
 					
 					for(Bitu k = 0; k < chunks; k++) { // chunks counter
 						xga.waitcmd.newline = false;
 						for(Bitu n = 0; n < chunksize; n++) { // pixels
-							Bitu mixmode;
-							
 							// This formula can rule the world ;)
-							Bitu mask = 1 << ((((n&0xF8)+(8-(n&0x7)))-1)+chunksize*k);
-							if(val&mask) mixmode = xga.foremix;
-							else mixmode = xga.backmix;
-							
-							switch((mixmode >> 5) & 0x03) {
-								case 0x00: // Src is background color
-									srcval = xga.backcolor;
-									break;
-								case 0x01: // Src is foreground color
-									srcval = xga.forecolor;
-									break;
-								default:
-									LOG_MSG("XGA: DrawBlitWait: Unsupported src %x",
-										(mixmode >> 5) & 0x03);
-									srcval=0;
-									break;
+							const Bitu mask = 1u << ((((n&0xF8)+(8-(n&0x7)))-1)+chunksize*k);
+							const bool use_fore = (val & mask) != 0;
+							const Bitu selected_mix = use_fore ? foremix : backmix;
+							Bitu selected_src;
+
+							if(GCC_LIKELY(decoded_sources)) {
+								selected_src = use_fore ? foresrc : backsrc;
+							} else {
+								switch((selected_mix >> 5) & 0x03) {
+									case 0x00:
+										selected_src = xga.backcolor;
+										break;
+									case 0x01:
+										selected_src = xga.forecolor;
+										break;
+									default:
+										LOG_MSG("XGA: DrawBlitWait: Unsupported src %x",
+											(selected_mix >> 5) & 0x03);
+										selected_src = 0;
+										break;
+								}
 							}
-                            XGA_DrawWaitSub(mixmode, srcval);
+							XGA_DrawWaitSub(selected_mix, selected_src);
 
 							if((xga.waitcmd.cury<2048) &&
 							  (xga.waitcmd.cury >= xga.waitcmd.y2)) {
@@ -704,6 +1047,7 @@ void XGA_DrawWait(Bitu val, Bitu len) {
 						} // pixels loop
 					} // chunks loop
 					break;
+				}
 
 				default:
 					LOG_MSG("XGA: DrawBlitWait: Unhandled mixmode: %d", mixmode);
@@ -716,13 +1060,12 @@ void XGA_DrawWait(Bitu val, Bitu len) {
 	}
 }
 
-void XGA_BlitRect(Bitu val) {
+static void XGA_BlitRect(Bitu val) {
 	Bit32u xat, yat;
 	Bitu srcdata;
-	Bitu dstdata;
+	Bitu colorcmpdata;
 
-	Bitu srcval;
-	Bitu destval;
+	Bitu srcval = 0;
 
 	Bits srcx, srcy, tarx, tary, dx, dy;
 
@@ -731,6 +1074,25 @@ void XGA_BlitRect(Bitu val) {
 
 	if(((val >> 5) & 0x01) != 0) dx = 1;
 	if(((val >> 7) & 0x01) != 0) dy = 1;
+
+	switch(XGA_COLOR_MODE) {
+		case M_LIN8:
+			colorcmpdata = xga.color_compare & 0xfful;
+			break;
+		case M_LIN15:
+		case M_LIN16:
+			colorcmpdata = xga.color_compare & 0xfffful;
+			break;
+		case M_LIN32:
+			colorcmpdata = xga.color_compare;
+			break;
+		default:
+			colorcmpdata = 0;
+			break;
+	}
+
+	const bool color_cmp_enabled = (xga.control1 & 0x100) != 0;
+	const bool color_cmp_src_ne = (xga.control1 & 0x080) != 0;
 
 	srcx = xga.curx;
 	srcy = xga.cury;
@@ -755,14 +1117,40 @@ void XGA_BlitRect(Bitu val) {
 	}
 
 
+	/* With fixed FOREMIX the source selector is invariant. The solid forms do
+	 * not depend on source VRAM at all; the bitmap form only needs one source
+	 * read per pixel. All other modes retain the original general path. */
+	if(mixselect == 0x00) {
+		switch((mixmode >> 5) & 0x03) {
+			case 0x00:
+				XGA_BlitRectConstantSource(dx, dy, mixmode, xga.backcolor,
+				                           colorcmpdata, color_cmp_enabled,
+				                           color_cmp_src_ne);
+				return;
+			case 0x01:
+				XGA_BlitRectConstantSource(dx, dy, mixmode, xga.forecolor,
+				                           colorcmpdata, color_cmp_enabled,
+				                           color_cmp_src_ne);
+				return;
+			case 0x03:
+				XGA_BlitRectBitmapSource(dx, dy, mixmode, colorcmpdata,
+				                         color_cmp_enabled, color_cmp_src_ne);
+				return;
+			default:
+				break; /* PIX_TRANS source keeps the original fallback */
+		}
+	}
+
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+
 	/* Copy source to video ram */
-	for(yat=0;yat<=xga.MIPcount ;yat++) {
+	for(yat=0;yat<=height ;yat++) {
 		srcx = xga.curx;
 		tarx = xga.destx;
 
-		for(xat=0;xat<=xga.MAPcount;xat++) {
+		for(xat=0;xat<=width;xat++) {
 			srcdata = XGA_GetPoint(srcx, srcy);
-			dstdata = XGA_GetPoint(tarx, tary);
 
 			if(mixselect == 0x3) {
 				if(srcdata == xga.forecolor) {
@@ -796,10 +1184,10 @@ void XGA_BlitRect(Bitu val) {
 					break;
 			}
 
-			destval = XGA_GetMixResult(mixmode, srcval, dstdata);
-			//LOG_MSG("XGA: DrawPattern: Mixmode: %x Mixselect: %x", mixmode, mixselect);
-
-			XGA_DrawPoint(tarx, tary, destval);
+			/* MULT_MISC bit 8 enables COLOR_CMP. Bit 7 (SRC_NE)
+			 * selects whether equal or non-equal source pixels are skipped. */
+			XGA_BlitWritePixel(tarx, tary, mixmode, srcval, colorcmpdata,
+			                   color_cmp_enabled, color_cmp_src_ne);
 
 			srcx += dx;
 			tarx += dx;
@@ -809,11 +1197,83 @@ void XGA_BlitRect(Bitu val) {
 	}
 }
 
-void XGA_DrawPattern(Bitu val) {
-	Bitu srcdata;
-	Bitu dstdata;
+/* Fixed FOREMIX with a solid source does not use the 8x8 pattern bitmap.
+ * This removes one source-VRAM read for every destination pixel. */
+static void XGA_DrawSolidPattern(Bits dx, Bits dy, Bitu mixmode, Bitu srcval) {
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+	Bits tary = xga.desty;
 
-	Bitu srcval;
+	if((mixmode & 0x0f) == 0x03)
+		return;
+
+	if((mixmode & 0x0f) == 0x07) {
+		if(XGA_TryFastSolidFill8(xga.destx, xga.desty, dx, dy,
+		                            width + 1u, height + 1u, srcval))
+			return;
+		for(Bit32u yat = 0; yat <= height; ++yat) {
+			Bits tarx = xga.destx;
+			for(Bit32u xat = 0; xat <= width; ++xat) {
+				XGA_DrawPoint(tarx, tary, srcval);
+				tarx += dx;
+			}
+			tary += dy;
+		}
+		return;
+	}
+
+	for(Bit32u yat = 0; yat <= height; ++yat) {
+		Bits tarx = xga.destx;
+		for(Bit32u xat = 0; xat <= width; ++xat) {
+			XGA_DrawMixedPoint(tarx, tary, mixmode, srcval);
+			tarx += dx;
+		}
+		tary += dy;
+	}
+}
+
+/* Fixed FOREMIX with a bitmap source keeps the same source selector and
+ * ROP for the complete pattern command. */
+static void XGA_DrawBitmapPattern(Bits dx, Bits dy, Bitu mixmode) {
+	const Bit32u height = xga.MIPcount;
+	const Bit32u width = xga.MAPcount;
+	const Bits srcx = xga.curx;
+	const Bits srcy = xga.cury;
+	Bits tary = xga.desty;
+
+	if((mixmode & 0x0f) == 0x03)
+		return;
+
+	if((mixmode & 0x0f) == 0x07) {
+		for(Bit32u yat = 0; yat <= height; ++yat) {
+			Bits tarx = xga.destx;
+			for(Bit32u xat = 0; xat <= width; ++xat) {
+				const Bitu srcval = XGA_GetPoint(srcx + (tarx & 0x7),
+				                                  srcy + (tary & 0x7));
+				XGA_DrawPoint(tarx, tary, srcval);
+				tarx += dx;
+			}
+			tary += dy;
+		}
+		return;
+	}
+
+	for(Bit32u yat = 0; yat <= height; ++yat) {
+		Bits tarx = xga.destx;
+		for(Bit32u xat = 0; xat <= width; ++xat) {
+			const Bitu srcval = XGA_GetPoint(srcx + (tarx & 0x7),
+			                                  srcy + (tary & 0x7));
+			XGA_DrawMixedPoint(tarx, tary, mixmode, srcval);
+			tarx += dx;
+		}
+		tary += dy;
+	}
+}
+
+static void XGA_DrawPattern(Bitu val) {
+	Bitu srcdata;
+
+	Bitu srcval = 0;
 	Bitu destval;
 
 	Bits xat, yat, srcx, srcy, tarx, tary, dx, dy;
@@ -846,15 +1306,33 @@ void XGA_DrawPattern(Bitu val) {
 			break;
 	}
 
-	for(yat=0;yat<=xga.MIPcount;yat++) {
+	const Bits height = xga.MIPcount;
+	const Bits width = xga.MAPcount;
+
+	/* With fixed FOREMIX, BACKCOLOR and FORECOLOR are invariant and the
+	 * pattern bitmap is not consulted at all. */
+	if(mixselect == 0x00) {
+		switch((mixmode >> 5) & 0x03) {
+			case 0x00:
+				XGA_DrawSolidPattern(dx, dy, mixmode, xga.backcolor);
+				return;
+			case 0x01:
+				XGA_DrawSolidPattern(dx, dy, mixmode, xga.forecolor);
+				return;
+			case 0x03:
+				XGA_DrawBitmapPattern(dx, dy, mixmode);
+				return;
+			default:
+				break; /* preserve PIX_TRANS diagnostics in fallback */
+		}
+	}
+
+	for(yat=0;yat<=height;yat++) {
 		tarx = xga.destx;
-		for(xat=0;xat<=xga.MAPcount;xat++) {
+		for(xat=0;xat<=width;xat++) {
 
 			srcdata = XGA_GetPoint(srcx + (tarx & 0x7), srcy + (tary & 0x7));
 			//LOG_MSG("patternpoint (%3d/%3d)v%x",srcx + (tarx & 0x7), srcy + (tary & 0x7),srcdata);
-			dstdata = XGA_GetPoint(tarx, tary);
-			
-
 			if(mixselect == 0x3) {
 				// TODO lots of guessing here but best results this way
 				/*if(srcdata == xga.forecolor)*/ mixmode = xga.foremix;
@@ -882,7 +1360,7 @@ void XGA_DrawPattern(Bitu val) {
 					break;
 			}
 
-			destval = XGA_GetMixResult(mixmode, srcval, dstdata);
+			destval = XGA_GetMixResult(mixmode, srcval, tarx, tary);
 
 			XGA_DrawPoint(tarx, tary, destval);
 			
@@ -892,7 +1370,8 @@ void XGA_DrawPattern(Bitu val) {
 	}
 }
 
-void XGA_DrawCmd(Bitu val, Bitu len) {
+static void XGA_DrawCmd(Bitu val, Bitu len) {
+	(void)len;
 	Bit16u cmd;
 	cmd = val >> 13;
 #if XGA_SHOW_COMMAND_TRACE == 1
@@ -971,7 +1450,7 @@ void XGA_DrawCmd(Bitu val, Bitu len) {
 	}
 }
 
-void XGA_SetDualReg(Bit32u& reg, Bitu val) {
+static void XGA_SetDualReg(Bit32u& reg, Bitu val) {
 	switch(XGA_COLOR_MODE) {
 	case M_LIN8:
 		reg = (Bit8u)(val&0xff); break;
@@ -990,7 +1469,7 @@ void XGA_SetDualReg(Bit32u& reg, Bitu val) {
 	}
 }
 
-Bitu XGA_GetDualReg(Bit32u reg) {
+static Bitu XGA_GetDualReg(Bit32u reg) {
 	switch(XGA_COLOR_MODE) {
 	case M_LIN8:
 		return (Bit8u)(reg&0xff);
@@ -1129,7 +1608,7 @@ void XGA_Write(Bitu port, Bitu val, Bitu len) {
 			xga.destx = val&0x3fff;
 			break;
 		case 0xb2e8:
-			LOG_MSG("COLOR_CMP not implemented");
+			XGA_SetDualReg(xga.color_compare, val);
 			break;
 		case 0xb6e8:
 			xga.backmix = val;
@@ -1199,6 +1678,8 @@ Bitu XGA_Read(Bitu port, Bitu len) {
 			else return 0x0;
 		case 0xbee8:
 			return XGA_Read_Multifunc();
+		case 0xb2e8:
+			return XGA_GetDualReg(xga.color_compare);
 		case 0xa2e8:
 			return XGA_GetDualReg(xga.backcolor);
 			break;
