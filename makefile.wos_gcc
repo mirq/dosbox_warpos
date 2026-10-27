@@ -1,0 +1,164 @@
+#
+# DOSBox for WarpOS/PPC with 3dfx Voodoo rendered through MiniGL V19.
+#
+# Cross-builds with ppc-amigaos-gcc (adtools GCC 8.4.0) + the MOS2WOS WarpOS
+# SDK overlay (see $(MGL_DIR)/Makefile.wos.gcc.common) and links the SDK's
+# WarpOS SDL 1.2 plus the MiniGL dispatch import archive, which loads
+# minigl_ppc.dll at runtime. Same ET_REL contract as quake3amiga's
+# makefile.wos_gcc_v19.
+#
+# Produces an ET_REL .warpelf that must be converted to a WarpOS executable
+# ON THE AMIGA with target-hosted Elf2Exe2:
+#   Stack 100000
+#   Elf2Exe2 dosbox.warpelf DOSBoxWOS
+#
+# Deploy DOSBoxWOS next to minigl_ppc.dll and dosbox.conf. Per boot: C:InitPPC
+# once, start the MiniGL 68k host, then run DOSBoxWOS (see
+# src/platform/warpos/README).
+#
+# Build:  make -f makefile.wos_gcc [CPU=7400|604e] [B=objdir] [DEBUG=1]
+#
+
+MGL_DIR ?= /home/mirek/MiniGL_WOS_V19_mglQ3
+CPU ?= 7400
+include $(MGL_DIR)/Makefile.wos.gcc.common
+
+CXX := $(WOS_CROSS)g++
+OBJCOPY := $(WOS_CROSS)objcopy
+
+# C++ inline functions and templates land in COMDAT section groups. This
+# binutils (2.23) keeps those as ~4000 separate .group/.text.* sections in a
+# relocatable link (no --force-group-allocation), which Elf2Exe2 would turn
+# into hunks. Strip the group wrappers from every C++ object and from
+# libstdc++ so the ET_REL link folds the members into the normal sections;
+# duplicate copies stay behind as unreferenced code under one weak symbol.
+UNGROUP = $(OBJCOPY) -R .group
+
+B ?= wos_objs
+
+# Load the MiniGL DLL from the program directory, like the validated clients.
+MGL_DLL_OVERRIDE ?= minigl_ppc.dll
+
+WOS_ETREL_LDSCRIPT := src/platform/warpos/warpos-etrel.ld
+
+ifeq ($(DEBUG),1)
+OPTFLAGS = -O1 -g
+else
+OPTFLAGS = -O2 -fomit-frame-pointer
+endif
+
+DEFS = -D__WARPOS__ -DMINIGL_DISPATCH_CLIENT -DWOS_MOS2WOS -D__saveds= \
+       -DHAVE_CONFIG_H -DNDEBUG
+# src/platform/warpos/include overrides SDK libstdc++ headers that do not
+# match the prebuilt libstdc++.a (bits/gthr-default.h: mutex size).
+INCS = -I. -Iinclude -Isrc/platform/warpos -Isrc/platform/warpos/include -I$(MGL_DIR)/include
+
+# WOS_ARCH_CFLAGS carries -mcpu=$(CPU) and the mandatory -fno-jump-tables.
+COMMON_FLAGS = $(WOS_ARCH_CFLAGS) $(OPTFLAGS) -fno-strict-aliasing -w \
+               $(DEFS) $(INCS) $(WOS_CPPFLAGS)
+CFLAGS   = -std=gnu99 $(COMMON_FLAGS)
+# No exceptions: the WOS runtime archives' unwind tables need R_PPC_REL32,
+# which Elf2Exe2 rejects, so .eh_frame is discarded at link time and DOSBox's
+# throw sites use the C_NO_EXCEPTIONS longjmp exit path instead.
+CXXFLAGS = -std=gnu++11 -fno-exceptions $(COMMON_FLAGS)
+
+SRCS_CPP = \
+	src/dosbox.cpp \
+	$(addprefix src/cpu/, callback.cpp core_dynrec.cpp core_full.cpp core_normal.cpp \
+		core_prefetch.cpp core_simple.cpp cpu.cpp flags.cpp modrm.cpp paging.cpp) \
+	$(addprefix src/debug/, debug.cpp debug_disasm.cpp debug_gui.cpp) \
+	$(addprefix src/dos/, cdrom.cpp cdrom_image.cpp dos_classes.cpp dos.cpp dos_devices.cpp \
+		dos_execute.cpp dos_files.cpp dos_ioctl.cpp dos_keyboard_layout.cpp dos_memory.cpp \
+		dos_misc.cpp dos_mscdex.cpp dos_programs.cpp dos_tables.cpp drive_cache.cpp \
+		drive_fat.cpp drive_iso.cpp drive_local.cpp drive_overlay.cpp drives.cpp \
+		drive_virtual.cpp) \
+	src/fpu/fpu.cpp \
+	$(addprefix src/gui/, midi.cpp render.cpp render_scalers.cpp sdlmain.cpp sdl_mapper.cpp) \
+	$(addprefix src/hardware/, adlib.cpp cmos.cpp dbopl.cpp disney.cpp dma.cpp gameblaster.cpp \
+		gus.cpp hardware.cpp iohandler.cpp joystick.cpp keyboard.cpp memory.cpp mixer.cpp \
+		mpu401.cpp pci_bus.cpp pcspeaker.cpp pic.cpp sblaster.cpp tandy_sound.cpp timer.cpp \
+		vga_attr.cpp vga.cpp vga_crtc.cpp vga_dac.cpp vga_draw.cpp vga_gfx.cpp vga_memory.cpp \
+		vga_misc.cpp vga_other.cpp vga_paradise.cpp vga_s3.cpp vga_seq.cpp vga_tseng.cpp \
+		vga_xga.cpp voodoo.cpp voodoo_interface.cpp voodoo_emu.cpp voodoo_minigl.cpp) \
+	$(addprefix src/hardware/mame/, fmopl.cpp saa1099.cpp sn76496.cpp ymdeltat.cpp ymf262.cpp) \
+	$(addprefix src/hardware/serialport/, misc_util.cpp nullmodem.cpp serialdummy.cpp \
+		serialport.cpp softmodem.cpp) \
+	$(addprefix src/ints/, bios.cpp bios_disk.cpp bios_keyboard.cpp ems.cpp int10_char.cpp \
+		int10.cpp int10_memory.cpp int10_misc.cpp int10_modes.cpp int10_pal.cpp \
+		int10_put_pixel.cpp int10_vesa.cpp int10_video_state.cpp int10_vptable.cpp \
+		mouse.cpp xms.cpp) \
+	$(addprefix src/misc/, cross.cpp messages.cpp programs.cpp setup.cpp support.cpp) \
+	$(addprefix src/shell/, shell_batch.cpp shell_cmds.cpp shell.cpp shell_misc.cpp)
+
+SRCS_C = \
+	src/platform/warpos/wos_mglinput.c \
+	src/platform/warpos/wos_video.c \
+	src/platform/warpos/wos_runtime.c
+
+SRCS_CPP += src/platform/warpos/wos_prof.cpp
+
+OBJS = $(addprefix $(B)/,$(SRCS_CPP:.cpp=.o) $(SRCS_C:.c=.o))
+
+# MiniGLOpen with the DLL name override, linked ahead of libminigl.a so it
+# replaces the archive member (whose DLL name is baked in at archive build).
+MINIGL_OPEN_O = $(B)/minigl_ppc_open.o
+
+# The exe gets dllLoadLibrary/dllGetProcAddress from our own packed build of
+# the Hyperion loader -- NOT from libminigl.a(dll.o), which is compiled
+# unpacked and corrupts the 2-byte packed DLL messages (see
+# src/platform/warpos/wos_hyperion_loader.c).
+HYPERION_LOADER_O = $(B)/wos_hyperion_loader.o
+
+LIBSTDCXX_UNGROUPED = $(B)/libstdc++_ungrouped.a
+LIBS = -lSDL $(LIBSTDCXX_UNGROUPED)
+
+DOSBOX = $(B)/dosbox.warpelf
+
+.PHONY: all clean check-tools
+
+all: check-tools $(DOSBOX)
+
+check-tools:
+	@test -x "$(CXX)" || { echo "missing compiler $(CXX)"; exit 1; }
+	@test -f "$(WOS_STARTFILE)" || { echo "missing $(WOS_STARTFILE)"; exit 1; }
+	@test -f "$(MGL_DIR)/include/proto/minigl.h" || { echo "missing MiniGL SDK at $(MGL_DIR)"; exit 1; }
+	@test -f "$(MGL_DIR)/lib/libminigl.a" || { echo "missing $(MGL_DIR)/lib/libminigl.a"; exit 1; }
+	@test -f "$(MGL_DIR)/client/minigl_ppc_open.c"
+	@test -f "$(MGL_DIR)/hyperion_dll/dll.c"
+
+$(DOSBOX): $(OBJS) $(MINIGL_OPEN_O) $(HYPERION_LOADER_O) $(MGL_DIR)/lib/libminigl.a $(LIBSTDCXX_UNGROUPED) $(WOS_ETREL_LDSCRIPT)
+	$(LD) $(WOS_LINK_FLAGS) $(WOS_LIBRARY_DIRS) -o $@ \
+		$(WOS_STARTFILE) $(OBJS) $(MINIGL_OPEN_O) $(HYPERION_LOADER_O) \
+		$(MGL_DIR)/lib/libminigl.a $(LIBS) $(WOS_RUNTIME_LIBS) $(WOS_ENDFILE)
+	$(call WOS_VALIDATE_ETREL,$@)
+
+# Drop an output that failed WOS_VALIDATE_ETREL so the next make relinks.
+.DELETE_ON_ERROR:
+
+$(B)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -o $@ -c $<
+	$(UNGROUP) $@
+
+$(LIBSTDCXX_UNGROUPED): $(WOS_SDK_ROOT)/lib/libstdc++.a
+	@mkdir -p $(dir $@)
+	$(UNGROUP) $< $@
+
+$(B)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -o $@ -c $<
+
+$(MINIGL_OPEN_O): $(MGL_DIR)/client/minigl_ppc_open.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I$(MGL_DIR)/hyperion_dll \
+	  -DMINIGL_PPC_DLLNAME="\"$(MGL_DLL_OVERRIDE)\"" -o $@ -c $<
+
+$(HYPERION_LOADER_O): src/platform/warpos/wos_hyperion_loader.c $(MGL_DIR)/hyperion_dll/dll.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I$(MGL_DIR)/hyperion_dll \
+	  -DHYPERION_DLL_C="\"$(MGL_DIR)/hyperion_dll/dll.c\"" -o $@ -c $<
+
+clean:
+	rm -rf $(B)
+
+-include $(OBJS:.o=.d)

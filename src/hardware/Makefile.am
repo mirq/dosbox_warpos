@@ -4,7 +4,7 @@ SUBDIRS = serialport mame
 
 EXTRA_DIST = opl.cpp opl.h adlib.h dbopl.h pci_devices.h \
              voodoo_types.h voodoo_def.h voodoo_data.h voodoo_emu.h voodoo_opengl.h \
-             voodoo_core.h voodoo_regs.h
+             voodoo_interface.h
 
 noinst_LIBRARIES = libhardware.a
 
@@ -13,6 +13,6 @@ libhardware_a_SOURCES = adlib.cpp dma.cpp gameblaster.cpp hardware.cpp iohandler
 			vga.cpp vga_attr.cpp vga_crtc.cpp vga_dac.cpp vga_draw.cpp vga_gfx.cpp vga_other.cpp \
 			vga_memory.cpp vga_misc.cpp vga_seq.cpp vga_xga.cpp vga_s3.cpp vga_tseng.cpp vga_paradise.cpp \
 			cmos.cpp disney.cpp gus.cpp mpu401.cpp ipx.cpp ipxserver.cpp dbopl.cpp \
-			voodoo.cpp voodoo_emu.cpp voodoo_opengl.cpp
+			voodoo.cpp voodoo_interface.cpp voodoo_emu.cpp voodoo_minigl.cpp
 
 

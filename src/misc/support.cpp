@@ -187,7 +187,32 @@ void E_Exit(const char * format,...) {
 	va_end(msg);
 
 	buf[sizeof(buf) - 1] = '\0';
-	//strcat(buf,"\n"); catcher should handle the end of line.. 
+	//strcat(buf,"\n"); catcher should handle the end of line..
 
+#if C_NO_EXCEPTIONS
+	if (dosbox_exit_armed) {
+		dosbox_exit_armed = false;
+		dosbox_exit_error = buf;
+		longjmp(dosbox_exit_jmp, DOSBOX_EXIT_ERROR);
+	}
+	/* Outside the main loop (e.g. during shutdown) there is nobody to unwind to. */
+	fprintf(stderr, "Exit to error: %s\n", buf);
+	exit(1);
+#else
 	throw(buf);
+#endif
 }
+
+#if C_NO_EXCEPTIONS
+jmp_buf dosbox_exit_jmp;
+bool dosbox_exit_armed = false;
+const char * dosbox_exit_error = 0;
+
+void DOSBOX_Quit(void) {
+	if (dosbox_exit_armed) {
+		dosbox_exit_armed = false;
+		longjmp(dosbox_exit_jmp, DOSBOX_EXIT_QUIT);
+	}
+	exit(0);
+}
+#endif

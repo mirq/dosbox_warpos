@@ -1,0 +1,15 @@
+.KEY args/F
+; DOSBox for WarpOS with MiniGL Voodoo (R200 stack).
+; Run from the DOSBox drawer:  Execute DOSBox-WOS [dosbox arguments]
+; Same MiniGL environment as the Quake3-R200 launch script.
+FailAt 21
+Delete ENV:MGLPPC_LEASE QUIET
+SetEnv MGLPPC_NOALTIVEC 1
+SetEnv MGLPPC_CPEMIT 1
+SetEnv MGLPPC_HOSTPRI -1
+SetEnv MGLPPC_CPPRESENT 1
+Stack 65536
+Run >NIL: minigl_ppc_host >NIL:
+Wait 6
+Stack 1048576
+DOSBoxWOS <args>

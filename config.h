@@ -253,6 +253,21 @@
 /* Define to `int` if you don't have socklen_t */
 /* #undef socklen_t */
 
+/* WarpOS (MOS2WOS SDK, built by makefile.wos_gcc): SDL 1.2 frontend without
+   OpenGL output or SDL_sound, C++ exceptions unavailable in the ET_REL exe,
+   Voodoo rendered through MiniGL. */
+#if defined(__WARPOS__)
+#undef C_OPENGL
+#undef C_SDL_SOUND
+#undef C_SRECORD
+#undef DB_HAVE_CLOCK_GETTIME
+#undef ENVIRON_LINKED
+#undef HAVE_PWD_H
+#define C_NO_EXCEPTIONS 1
+#define C_VOODOO_MINIGL 1
+#define PCI_FUNCTIONALITY_ENABLED 1
+#endif
+
 #if C_ATTRIBUTE_ALWAYS_INLINE
 #define INLINE inline __attribute__((always_inline))
 #else

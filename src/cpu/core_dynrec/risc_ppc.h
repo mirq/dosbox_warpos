@@ -41,7 +41,9 @@
 // disable if your toolchain doesn't provide a _SDA_BASE_ symbol (r13 constant value)
 //#define USE_SDA_BASE
 #endif
+#ifndef __WARPOS__
 #include <proto/exec.h>
+#endif
 // register mapping
 enum HostReg {
 	HOST_R0=0,
@@ -947,12 +949,16 @@ static void gen_fill_branch_long(Bit32u data) {
 
 #ifdef __APPLE__
 extern "C" void sys_icache_invalidate(void* start, size_t len);
+#elif defined(__WARPOS__)
+#include "wos_platform.h"
 #endif
 
 static void cache_block_closing(Bit8u* block_start,Bitu block_size)
 {
 #ifdef __APPLE__
 	sys_icache_invalidate((void*)block_start, (size_t)block_size);
+#elif defined(__WARPOS__)
+	WOS_FlushCodeCache(block_start, (size_t)block_size);
 #else
 	CacheFlushDataInstArea(block_start, block_size);
 #endif

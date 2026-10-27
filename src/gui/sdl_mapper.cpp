@@ -2348,6 +2348,12 @@ void MAPPER_Run(bool pressed) {
 SDL_Surface* SDL_SetVideoMode_Wrap(int width,int height,int bpp,Bit32u flags);
 
 void MAPPER_RunInternal() {
+#if defined(__WARPOS__)
+	/* The mapper's editor draws on an SDL screen; SDL's video is not used
+	 * on WarpOS. Bindings still load from the mapper file. */
+	LOG_MSG("MAPPER: the key mapper editor is not available on WarpOS");
+	return;
+#endif
 	int cursor = SDL_ShowCursor(SDL_QUERY);
 	SDL_ShowCursor(SDL_ENABLE);
 	bool mousetoggle=false;
@@ -2432,7 +2438,13 @@ void MAPPER_StartUp(Section * sec) {
 
 	usescancodes = false;
 
+#if defined(__WARPOS__)
+	/* WarpOS SDL reports Amiga raw keys as scancodes, which the tables
+	 * below do not cover; always map through the symbolic keys. */
+	if (false) {
+#else
 	if (section->Get_bool("usescancodes")) {
+#endif
 		usescancodes=true;
 
 		/* Note: table has to be tested/updated for various OSs */

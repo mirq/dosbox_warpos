@@ -1166,33 +1166,37 @@ void DOS_Shell::CMD_SUBST (char * args) {
 	localDrive* ldp=0;
 	char mountstring[DOS_PATHLENGTH+CROSS_LEN+20];
 	char temp_str[2] = { 0,0 };
-	try {
-		strcpy(mountstring,"MOUNT ");
-		StripSpaces(args);
-		std::string arg;
-		CommandLine command(0,args);
+	strcpy(mountstring,"MOUNT ");
+	StripSpaces(args);
+	std::string arg;
+	CommandLine command(0,args);
 
-		if (command.GetCount() != 2) throw 0 ;
+	if (command.GetCount() != 2) goto failure;
   
-		command.FindCommand(1,arg);
-		if( (arg.size()>1) && arg[1] !=':')  throw(0);
-		temp_str[0]=(char)toupper(args[0]);
-		command.FindCommand(2,arg);
-		if((arg=="/D") || (arg=="/d")) {
-			if(!Drives[temp_str[0]-'A'] ) throw 1; //targetdrive not in use
-			strcat(mountstring,"-u ");
-			strcat(mountstring,temp_str);
-			this->ParseLine(mountstring);
+	command.FindCommand(1,arg);
+	if( (arg.size()>1) && arg[1] !=':')  goto failure;
+	temp_str[0]=(char)toupper(args[0]);
+	command.FindCommand(2,arg);
+	if((arg=="/D") || (arg=="/d")) {
+		if(!Drives[temp_str[0]-'A'] ) { //targetdrive not in use
+			WriteOut(MSG_Get("SHELL_CMD_SUBST_NO_REMOVE"));
 			return;
 		}
-		if(Drives[temp_str[0]-'A'] ) throw 0; //targetdrive in use
+		strcat(mountstring,"-u ");
 		strcat(mountstring,temp_str);
-		strcat(mountstring," ");
+		this->ParseLine(mountstring);
+		return;
+	}
+	if(Drives[temp_str[0]-'A'] ) goto failure; //targetdrive in use
+	strcat(mountstring,temp_str);
+	strcat(mountstring," ");
 
+	{
    		Bit8u drive;char fulldir[DOS_PATHLENGTH];
-		if (!DOS_MakeName(const_cast<char*>(arg.c_str()),fulldir,&drive)) throw 0;
+		if (!DOS_MakeName(const_cast<char*>(arg.c_str()),fulldir,&drive)) goto failure;
 	
-		if( ( ldp=dynamic_cast<localDrive*>(Drives[drive])) == 0 ) throw 0;
+		//only a localdrive can be substed
+		if( ( ldp=dynamic_cast<localDrive*>(Drives[drive])) == 0 ) goto failure;
 		char newname[CROSS_LEN];   
 		strcpy(newname, ldp->basedir);	   
 		strcat(newname,fulldir);
@@ -1203,20 +1207,10 @@ void DOS_Shell::CMD_SUBST (char * args) {
 		strcat(mountstring,"\"");	   
 		this->ParseLine(mountstring);
 	}
-	catch(int a){
-		if(a == 0) {
-			WriteOut(MSG_Get("SHELL_CMD_SUBST_FAILURE"));
-		} else {
-		       	WriteOut(MSG_Get("SHELL_CMD_SUBST_NO_REMOVE"));
-		}
-		return;
-	}
-	catch(...) {		//dynamic cast failed =>so no localdrive
-		WriteOut(MSG_Get("SHELL_CMD_SUBST_FAILURE"));
-		return;
-	}
-   
 	return;
+
+failure:
+	WriteOut(MSG_Get("SHELL_CMD_SUBST_FAILURE"));
 }
 
 void DOS_Shell::CMD_LOADHIGH(char *args){

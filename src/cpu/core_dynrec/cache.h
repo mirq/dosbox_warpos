@@ -17,8 +17,10 @@
  */
 
 
+#ifndef __WARPOS__
 #include <proto/exec.h>
 #include <exec/system.h>
+#endif
 class CodePageHandlerDynRec;	// forward
 
 #if defined(__MORPHOS__)

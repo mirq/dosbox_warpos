@@ -365,7 +365,13 @@ public:
 #endif
 			}
 
+#if defined(__WARPOS__)
+			/* AmigaDOS: "DH0:/" is the parent of DH0:, so a volume or assign
+			 * root stays as it is */
+			if (temp_line[temp_line.size()-1]!=CROSS_FILESPLIT && temp_line[temp_line.size()-1]!=':') temp_line+=CROSS_FILESPLIT;
+#else
 			if (temp_line[temp_line.size()-1]!=CROSS_FILESPLIT) temp_line+=CROSS_FILESPLIT;
+#endif
 			Bit8u bit8size=(Bit8u) sizes[1];
 			if (type=="cdrom") {
 				int num = -1;
@@ -580,7 +586,7 @@ private:
 		localDrive* ldp=0;
 		if (!DOS_MakeName(const_cast<char*>(filename),fullname,&drive)) return NULL;
 
-		try {		
+		DOSBOX_TRY {		
 			ldp=dynamic_cast<localDrive*>(Drives[drive]);
 			if(!ldp) return NULL;
 
@@ -610,7 +616,7 @@ private:
 
 			return tmpfile;
 		}
-		catch(...) {
+		DOSBOX_CATCH_ALL {
 			return NULL;
 		}
 	}
@@ -980,7 +986,7 @@ public:
 		localDrive* ldp=0;
 		if (!DOS_MakeName((char *)temp_line.c_str(),fullname,&drive)) return;
 
-		try {
+		DOSBOX_TRY {
 			/* try to read ROM file into buffer */
 			ldp=dynamic_cast<localDrive*>(Drives[drive]);
 			if(!ldp) return;
@@ -1033,7 +1039,7 @@ public:
 			}
 			else WriteOut(MSG_Get("PROGRAM_LOADROM_UNRECOGNIZED"));
 		}
-		catch(...) {
+		DOSBOX_CATCH_ALL {
 			return;
 		}
 	}
@@ -1057,7 +1063,7 @@ public:
 		localDrive* ldp = 0;
 		if (!DOS_MakeName((char *)temp_line.c_str(), fullname, &drive)) return;
 
-		try {
+		DOSBOX_TRY {
 			/* try to read ROM file into buffer */
 			ldp = dynamic_cast<localDrive*>(Drives[drive]);
 			if (!ldp) return;
@@ -1090,7 +1096,7 @@ public:
 			SegSet16(cs, 0xf000);
 			reg_eip = 0xfff0;
 		}
-		catch (...) {
+		DOSBOX_CATCH_ALL {
 			return;
 		}
 	}

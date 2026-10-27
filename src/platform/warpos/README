@@ -1,0 +1,106 @@
+DOSBox for WarpOS with MiniGL Voodoo
+====================================
+
+Build (Linux host)
+------------------
+
+    make -f makefile.wos_gcc            # G4 (-mcpu=7400)
+    make -f makefile.wos_gcc CPU=604e   # 604e cards
+
+Needs the adtools ppc-amigaos-gcc 8.4 toolchain, the MOS2WOS WarpOS SDK and
+the MiniGL V19 SDK; the paths come from $(MGL_DIR)/Makefile.wos.gcc.common
+(override MGL_DIR, WOS_TOOLCHAIN_BIN, MOS2WOS_ROOT as needed). The result is
+wos_objs/dosbox.warpelf, an ET_REL object that the link step has already
+checked against the Elf2Exe2 contract (no undefined/COMMON symbols, only
+ADDR32/ADDR16_LO/ADDR16_HA/REL24 relocations, _start at .text+0).
+
+Build notes
+-----------
+
+- No C++ exceptions: the SDK's libstdc++/libgcc unwind tables use R_PPC_REL32,
+  which Elf2Exe2 rejects, so .eh_frame is discarded and the sources are
+  compiled with -fno-exceptions. E_Exit and the quit paths longjmp back to
+  main() instead (C_NO_EXCEPTIONS in config.h, include/dosbox.h).
+- The C++ COMDAT section groups are stripped (objcopy -R .group) from every
+  object and from a copy of libstdc++.a: binutils 2.23 keeps them as
+  thousands of separate sections in a relocatable link.
+- Frontend is src/gui/sdlmain.cpp, but SDL is used for audio only. The
+  screen and input are native (src/platform/warpos/wos_video.c): a 15/16-bit
+  RTG screen of at least 640x480 (fullresolution sets a larger one), the
+  changed rows copied under one LockBitMapTagList per frame, and a backdrop
+  window polled with one SetSignal. Measured with SDL's video, SDL's event
+  pump (GetMsg plus a lowlevel joystick read, 3.5-4 ms) and surface updates
+  took most of the PPC's time. Always full screen; no key mapper editor
+  (bindings still load from the mapper file); no joystick yet.
+- No OpenGL output, no SDL_sound (CD audio from cue/bin images plays raw BIN
+  tracks only, no WAV/MP3/OGG tracks), no IPX or modem networking yet.
+- The SDK's bits/gthr-default.h does not match its libstdc++.a (64- vs
+  60-byte mutex): src/platform/warpos/include/bits/gthr-default.h overrides
+  it. Without it the first std::ifstream crashes in std::locale::operator=.
+- Profiling: SetEnv WOS_PROF 1 appends a line every 5 s to T:dbprof.txt
+  with the share of time in the CPU core, PIC events, event polling, tick
+  handling and frame updates, plus frames and the auto cycle count.
+- Disk images (imgmount) are read a sector per dos.library call and are
+  slow; mount the game's files as a drawer when possible.
+- src/platform/warpos/wos_runtime.c stubs the libitm symbols libstdc++
+  references weakly; nothing in DOSBox can reach them.
+
+Install
+-------
+
+On the Amiga, convert the object once per build:
+
+    Stack 100000
+    Elf2Exe2 dosbox.warpelf DOSBoxWOS
+
+Put DOSBoxWOS, the matched minigl_ppc.dll and dosbox.conf in one drawer.
+The configuration is read from that drawer (PROGDIR:dosbox.conf); mount
+AmigaDOS paths as usual, e.g. "mount c DH1:dos" or "mount d PROGDIR:games".
+
+Run
+---
+
+Put minigl_ppc_host and the DOSBox-WOS script (src/platform/warpos/) in the
+drawer too. Run C:InitPPC once per boot if your WarpOS setup needs it, then:
+
+    CD Work:DOSBox
+    Execute DOSBox-WOS [dosbox arguments]
+
+The script sets the MGLPPC_* environment of the Quake3-R200 release, starts
+minigl_ppc_host in the background (it stays running and is reused) and runs
+DOSBoxWOS with a 1 MB stack. MINIGL_CTILE is not set: LFB reads use
+glReadPixels, which a tiled render target would scramble.
+
+[voodoo] settings
+-----------------
+
+    voodoo_card=auto            ; false, software, minigl, auto (= minigl)
+    voodoo_memsize=4            ; 4 (one TMU) or 12 (two TMUs)
+    voodoo_minigl_fullscreen=true
+    voodoo_minigl_depth=16      ; 16 or 32
+
+The emulated card is a Voodoo Graphics (SST-1) on the PCI bus with its LFB
+at 0xD0000000; DOS Glide 2.x games find it as usual. With minigl the 3D
+output opens a MiniGL screen when a game enables the Voodoo display and
+closes it when the game switches back to VGA. If MiniGLOpen() fails (DLL
+missing, host not running) DOSBox logs it and falls back to software
+rendering through the normal DOSBox window.
+
+While the MiniGL screen is up, keyboard and mouse are read from the MiniGL
+window directly (the DOSBox key mapper is bypassed); Ctrl+F9 quits.
+
+Known limits of the MiniGL backend
+----------------------------------
+
+- SST-1 colour/alpha/texture combine units are mapped onto fixed-function
+  GL_MODULATE/GL_DECAL with per-vertex colours. Uncommon combiner modes
+  (subtract-and-add forms, local-select override, detail/LOD blending)
+  are approximated.
+- Fog is applied to vertex colours: exact for black fog and untextured
+  polygons, approximate for coloured fog on textured polygons.
+- No mipmaps; textures are uploaded at their base LOD.
+- LFB writes in accelerated mode are drawn as GL points and LFB reads use
+  glReadPixels; games that stream full frames through the LFB are slow.
+  Use voodoo_card=software for those.
+- Perspective-correct texturing relies on homogeneous vertices; whether the
+  R200 path interpolates perspective-correctly depends on the MiniGL backend.

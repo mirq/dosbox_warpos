@@ -1036,7 +1036,11 @@ static Bitu Reboot_Handler(void) {
 	LOG_MSG(text);
 	double start = PIC_FullIndex();
 	while((PIC_FullIndex()-start)<3000) CALLBACK_Idle();
+#if C_NO_EXCEPTIONS
+	DOSBOX_Quit();
+#else
 	throw 1;
+#endif
 	return CBRET_NONE;
 }
 

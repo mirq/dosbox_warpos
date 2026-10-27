@@ -38,11 +38,19 @@
 #include "cross.h"
 #include "programs.h"
 #include "support.h"
+#if defined(__WARPOS__)
+#include "wos_prof.h"
+#else
+#define WOS_PROF_BEGIN(id) do {} while (0)
+#define WOS_PROF_END(id) do {} while (0)
+#endif
 #include "mapper.h"
 #include "ints/int10.h"
 #include "render.h"
 #include "pci_bus.h"
+#ifdef __MORPHOS__
 #include "ne2000.h"
+#endif
 #include "voodoo.h"
 #ifdef __MORPHOS__
 #include "morphos_platform.h"
@@ -200,8 +208,13 @@ static void MorphOS_RecordCycleValue(Bit32s value)
 static Bitu Normal_Loop(void) {
 	Bits ret;
 	while (1) {
-		if (PIC_RunQueue()) {
+		WOS_PROF_BEGIN(WOS_PROF_PIC);
+		const bool pic_run = PIC_RunQueue();
+		WOS_PROF_END(WOS_PROF_PIC);
+		if (pic_run) {
+			WOS_PROF_BEGIN(WOS_PROF_CPU);
 			ret = (*cpudecoder)();
+			WOS_PROF_END(WOS_PROF_CPU);
 			if (GCC_UNLIKELY(ret<0)) return 1;
 			if (ret>0) {
 				if (GCC_UNLIKELY(ret >= CB_MAX)) return 0;
@@ -212,11 +225,32 @@ static Bitu Normal_Loop(void) {
 			if (DEBUG_ExitLoop()) return 0;
 #endif
 		} else {
+#if defined(__WARPOS__)
+			/* Every SDL event pump is a PPC->68k call costing several ms on
+			 * WarpOS; poll at 50 Hz instead of once per emulated millisecond. */
+			static Bit32u wos_last_events = 0;
+			const Bit32u wos_now = GetTicks();
+			if (wos_now - wos_last_events >= 20) {
+				wos_last_events = wos_now;
+				WOS_PROF_BEGIN(WOS_PROF_EVENTS);
+				GFX_Events();
+				WOS_PROF_END(WOS_PROF_EVENTS);
+			}
+#else
 			GFX_Events();
+#endif
 			if (ticksRemain>0) {
 				TIMER_AddTick();
 				ticksRemain--;
-			} else {increaseticks();return 0;}
+			} else {
+				WOS_PROF_BEGIN(WOS_PROF_TICKS);
+				increaseticks();
+				WOS_PROF_END(WOS_PROF_TICKS);
+#if defined(__WARPOS__)
+				WOS_Prof_Poll();
+#endif
+				return 0;
+			}
 		}
 	}
 }
@@ -653,6 +687,7 @@ void DOSBOX_Init(void) {
 #if defined(PCI_FUNCTIONALITY_ENABLED)
 	secprop=control->AddSection_prop("pci",&PCI_Init,false); //PCI bus
 
+#ifdef __MORPHOS__
 	secprop=control->AddSection_prop("ethernet",&NE2000_Init,false);
 	Pbool=secprop->Add_bool("ne2000",Property::Changeable::OnlyAtStart,false);
 	Pbool->Set_help("Enable an emulated Novell NE2000 ISA Ethernet adapter using a native MorphOS SANA-II backend.");
@@ -666,8 +701,25 @@ void DOSBOX_Init(void) {
 	Pstring->Set_help("MorphOS SANA-II network device path.");
 	Pint=secprop->Add_int("sana2_unit",Property::Changeable::OnlyAtStart,0);
 	Pint->Set_help("SANA-II device unit.");
+#endif
 
 	secprop=control->AddSection_prop("voodoo",&VOODOO_Init,false);
+#if defined(__WARPOS__)
+	const char *voodoo_cards[] = { "false", "software", "minigl", "auto", 0 };
+	Pstring=secprop->Add_string("voodoo_card",Property::Changeable::OnlyAtStart,"auto");
+	Pstring->Set_values(voodoo_cards);
+	Pstring->Set_help("Enable low-level 3dfx Voodoo Graphics SST-1 emulation. software uses the complete DOSBox-X/Aaron Giles rasterizer and shows the result through the normal DOSBox screen. minigl translates triangle, texture, depth, blend, clear and swap operations to MiniGL (minigl_ppc.dll) on its own screen. auto selects minigl.");
+	const char *voodoo_memory[] = { "4", "12", 0 };
+	Pint=secprop->Add_int("voodoo_memsize",Property::Changeable::OnlyAtStart,4);
+	Pint->Set_values(voodoo_memory);
+	Pint->Set_help("Voodoo memory configuration in MB: 4 provides one 2 MB TMU; 12 provides two 4 MB TMUs and 4 MB framebuffer memory.");
+	Pbool=secprop->Add_bool("voodoo_minigl_fullscreen",Property::Changeable::OnlyAtStart,true);
+	Pbool->Set_help("Open the MiniGL Voodoo display as a fullscreen screen (true) or as a window on the Workbench (false).");
+	const char *voodoo_depths[] = { "16", "32", 0 };
+	Pint=secprop->Add_int("voodoo_minigl_depth",Property::Changeable::OnlyAtStart,16);
+	Pint->Set_values(voodoo_depths);
+	Pint->Set_help("Pixel depth of the MiniGL Voodoo screen. The emulated Voodoo framebuffer is 16-bit.");
+#else
 	const char *voodoo_cards[] = { "false", "software", "tinygl", 0 };
 	Pstring=secprop->Add_string("voodoo_card",Property::Changeable::OnlyAtStart,"false");
 	Pstring->Set_values(voodoo_cards);
@@ -692,6 +744,7 @@ void DOSBOX_Init(void) {
 	Pint->Set_help("Voodoo memory configuration in MB: 4 provides one 2 MB TMU; 12 provides two 4 MB TMUs and 4 MB framebuffer memory.");
 	Pbool=secprop->Add_bool("voodoo_bilinear_filtering",Property::Changeable::OnlyAtStart,true);
 	Pbool->Set_help("Compatibility option retained for existing configurations. Texture filtering is controlled by the emulated SST-1 registers.");
+#endif // __WARPOS__
 #endif
 
 

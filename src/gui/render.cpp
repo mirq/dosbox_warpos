@@ -33,7 +33,7 @@
 
 #include "render_scalers.h"
 
-#ifndef __MORPHOS__
+#if !defined(__MORPHOS__) && C_OPENGL
 #include "SDL_opengl.h"
 #endif
 
@@ -175,6 +175,9 @@ ScalerLineHandler_t RENDER_DrawLine;
 static void RENDER_CallBack( GFX_CallBackFunctions_t function );
 #ifndef __MORPHOS__
 extern SDL_Block sdl;
+#if defined(__WARPOS__)
+Bitu WOS_GFX_MapRGB(Bit8u red,Bit8u green,Bit8u blue);	/* sdlmain.cpp */
+#endif
 
 Bitu inline GFX_GetRGB(Bit8u red,Bit8u green,Bit8u blue) {
 	switch (sdl.desktop.type) {
@@ -202,6 +205,8 @@ Bitu inline GFX_GetRGB(Bit8u red,Bit8u green,Bit8u blue) {
 			return (u << 0) | (y << 8) | (v << 16) | (y << 24);
 #endif
 		}
+#elif defined(__WARPOS__)
+		return WOS_GFX_MapRGB(red,green,blue);	/* native screen, no SDL surface */
 #else
 		return SDL_MapRGB(sdl.surface->format,red,green,blue);
 

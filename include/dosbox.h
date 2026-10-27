@@ -24,6 +24,24 @@
 
 GCC_ATTRIBUTE(noreturn) void E_Exit(const char * message,...) GCC_ATTRIBUTE( __format__(__printf__, 1, 2));
 
+#if C_NO_EXCEPTIONS
+/* Without C++ exceptions, E_Exit and the quit paths longjmp back to main().
+ * main() arms dosbox_exit_jmp; setjmp() then returns one of these. */
+#include <setjmp.h>
+enum { DOSBOX_EXIT_QUIT = 1, DOSBOX_EXIT_ERROR = 2 };
+extern jmp_buf dosbox_exit_jmp;
+extern bool dosbox_exit_armed;
+extern const char * dosbox_exit_error;
+/* Replaces "throw 1"/"throw 0": leave the emulation loop normally. */
+GCC_ATTRIBUTE(noreturn) void DOSBOX_Quit(void);
+/* For try { } catch(...) { } blocks that only guard against failures. */
+#define DOSBOX_TRY if (true)
+#define DOSBOX_CATCH_ALL if (false)
+#else
+#define DOSBOX_TRY try
+#define DOSBOX_CATCH_ALL catch(...)
+#endif
+
 void MSG_Add(const char*,const char*); //add messages to the internal languagefile
 const char* MSG_Get(char const *);     //get messages from the internal languagefile
 

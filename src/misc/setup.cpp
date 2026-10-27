@@ -33,13 +33,20 @@
 
 using namespace std;
 static std::string current_config_dir; // Set by parseconfigfile so Prop_path can use it to construct the realpath
+
+/* WrongType is never caught; without exceptions report it through E_Exit. */
+#if C_NO_EXCEPTIONS
+#define THROW_WRONGTYPE() E_Exit("CONFIG: Value used with the wrong type")
+#else
+#define THROW_WRONGTYPE() throw WrongType()
+#endif
 void Value::destroy() throw(){
 	if (type == V_STRING) delete _string;
 }
 
 Value& Value::copy(Value const& in) {
 	if (this != &in) { //Selfassigment!
-		if(type != V_NONE && type != in.type) throw WrongType();
+		if(type != V_NONE && type != in.type) THROW_WRONGTYPE();
 		destroy();
 		plaincopy(in);
 	}
@@ -56,27 +63,27 @@ void Value::plaincopy(Value const& in) throw(){
 }
 
 Value::operator bool () const {
-	if(type != V_BOOL) throw WrongType();
+	if(type != V_BOOL) THROW_WRONGTYPE();
 	return _bool;
 }
 
 Value::operator Hex () const {
-	if(type != V_HEX) throw WrongType();
+	if(type != V_HEX) THROW_WRONGTYPE();
 	return _hex;
 }
 
 Value::operator int () const {
-	if(type != V_INT) throw WrongType();
+	if(type != V_INT) THROW_WRONGTYPE();
 	return _int;
 }
 
 Value::operator double () const {
-	if(type != V_DOUBLE) throw WrongType();
+	if(type != V_DOUBLE) THROW_WRONGTYPE();
 	return _double;
 }
 
 Value::operator char const* () const {
-	if(type != V_STRING) throw WrongType();
+	if(type != V_STRING) THROW_WRONGTYPE();
 	return _string->c_str();
 }
 
@@ -109,9 +116,9 @@ bool Value::SetValue(string const& in,Etype _type) {
 	/* Throw exception if the current type isn't the wanted type 
 	 * Unless the wanted type is current.
 	 */
-	if(_type == V_CURRENT && type == V_NONE) throw WrongType();
+	if(_type == V_CURRENT && type == V_NONE) THROW_WRONGTYPE();
 	if(_type != V_CURRENT) { 
-		if(type != V_NONE && type != _type) throw WrongType();
+		if(type != V_NONE && type != _type) THROW_WRONGTYPE();
 		type = _type;
 	}
 	bool retval = true;
@@ -136,7 +143,7 @@ bool Value::SetValue(string const& in,Etype _type) {
 		case V_CURRENT:
 		default:
 			/* Shouldn't happen!/Unhandled */
-			throw WrongType();
+			THROW_WRONGTYPE();
 			break;
 	}
 	return retval;
@@ -898,12 +905,16 @@ bool Config::ParseConfigFile(char const * const configfilename) {
 		}
 			break;
 		default:
+#if C_NO_EXCEPTIONS
+			if(currentsection) currentsection->HandleInputline(gegevens);
+#else
 			try {
 				if(currentsection) currentsection->HandleInputline(gegevens);
 			} catch(const char* message) {
 				message=0;
 				//EXIT with message
 			}
+#endif
 			break;
 		}
 	}

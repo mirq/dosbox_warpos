@@ -232,6 +232,136 @@ struct SDL_Block {
 
 SDL_Block sdl;
 
+#if defined(__WARPOS__)
+/* WarpOS: native RTG screen and IDCMP input (src/platform/warpos/wos_video.c)
+ * instead of SDL's video, which costs several PPC->68k calls per frame and per
+ * event poll. SDL is still used for audio. DOSBox renders into a picture in
+ * main memory; GFX_EndUpdate copies the changed rows to the card under one
+ * bitmap lock. Window events become SDL_Events so GFX_Events and the key
+ * mapper below run unchanged. Always full screen. */
+#include "wos_video.h"
+
+static struct {
+	Bit8u *pic;
+	Bitu pitch;
+	Bitu pic_size;
+	WOS_VideoFormat fmt;
+	int ranges[2 * 1024];
+} wos;
+
+Bitu WOS_GFX_MapRGB(Bit8u red,Bit8u green,Bit8u blue) {
+	const Bitu r = wos.fmt.bgr ? blue : red;
+	const Bitu b = wos.fmt.bgr ? red : blue;
+	if (wos.fmt.bits == 15) return ((r >> 3) << 10) | ((green >> 3) << 5) | (b >> 3);
+	return ((r >> 3) << 11) | ((green >> 2) << 5) | (b >> 3);
+}
+
+static Bitu WOS_SetSize(Bitu width,Bitu height,Bitu flags) {
+	/* 640x480 at least: a 640x400 RTG mode left an undrawn band on the
+	 * test monitor. fullresolution, when set, is the screen size. */
+	int w = (int)width, h = (int)height;
+	if (sdl.desktop.full.fixed) {
+		if (w < sdl.desktop.full.width) w = sdl.desktop.full.width;
+		if (h < sdl.desktop.full.height) h = sdl.desktop.full.height;
+	}
+	if (w < 640) w = 640;
+	if (h < 480) h = 480;
+	if (WOS_Video_Open(w,h,&wos.fmt) != 0)
+		E_Exit("Could not open a %dx%d screen: %s",w,h,WOS_Video_Error());
+	const Bitu retFlags = (wos.fmt.bits == 16) ? GFX_CAN_16 : GFX_CAN_15;
+	if (!(flags & retFlags))
+		E_Exit("The renderer cannot draw the screen's %d-bit format",wos.fmt.bits);
+	sdl.clip.w = (Bit16u)width;
+	sdl.clip.h = (Bit16u)height;
+	sdl.clip.x = (Sint16)(((WOS_Video_Width() - (int)width) / 2) & ~1);
+	sdl.clip.y = (Sint16)((WOS_Video_Height() - (int)height) / 2);
+	wos.pitch = (width * 2 + 3) & ~3;
+	const Bitu size = wos.pitch * height;
+	if (size > wos.pic_size) {
+		free(wos.pic);
+		wos.pic = (Bit8u *)malloc(size);
+		if (!wos.pic) E_Exit("Out of memory for a %dx%d picture",(int)width,(int)height);
+		wos.pic_size = size;
+	}
+	memset(wos.pic,0,size);
+	WOS_Video_Clear();
+	sdl.desktop.type = SCREEN_SURFACE;
+	GFX_Start();
+	return retFlags;
+}
+
+/* Amiga raw key -> SDL key, for the mapper's symbolic bindings. */
+static const SDLKey wos_keymap[0x80] = {
+	/* 0x00 */ SDLK_BACKQUOTE, SDLK_1, SDLK_2, SDLK_3, SDLK_4, SDLK_5, SDLK_6, SDLK_7,
+	/* 0x08 */ SDLK_8, SDLK_9, SDLK_0, SDLK_MINUS, SDLK_EQUALS, SDLK_BACKSLASH, SDLK_UNKNOWN, SDLK_KP0,
+	/* 0x10 */ SDLK_q, SDLK_w, SDLK_e, SDLK_r, SDLK_t, SDLK_y, SDLK_u, SDLK_i,
+	/* 0x18 */ SDLK_o, SDLK_p, SDLK_LEFTBRACKET, SDLK_RIGHTBRACKET, SDLK_UNKNOWN, SDLK_KP1, SDLK_KP2, SDLK_KP3,
+	/* 0x20 */ SDLK_a, SDLK_s, SDLK_d, SDLK_f, SDLK_g, SDLK_h, SDLK_j, SDLK_k,
+	/* 0x28 */ SDLK_l, SDLK_SEMICOLON, SDLK_QUOTE, SDLK_BACKSLASH, SDLK_UNKNOWN, SDLK_KP4, SDLK_KP5, SDLK_KP6,
+	/* 0x30 */ SDLK_LESS, SDLK_z, SDLK_x, SDLK_c, SDLK_v, SDLK_b, SDLK_n, SDLK_m,
+	/* 0x38 */ SDLK_COMMA, SDLK_PERIOD, SDLK_SLASH, SDLK_UNKNOWN, SDLK_KP_PERIOD, SDLK_KP7, SDLK_KP8, SDLK_KP9,
+	/* 0x40 */ SDLK_SPACE, SDLK_BACKSPACE, SDLK_TAB, SDLK_KP_ENTER, SDLK_RETURN, SDLK_ESCAPE, SDLK_DELETE, SDLK_INSERT,
+	/* 0x48 */ SDLK_PAGEUP, SDLK_PAGEDOWN, SDLK_KP_MINUS, SDLK_F11, SDLK_UP, SDLK_DOWN, SDLK_RIGHT, SDLK_LEFT,
+	/* 0x50 */ SDLK_F1, SDLK_F2, SDLK_F3, SDLK_F4, SDLK_F5, SDLK_F6, SDLK_F7, SDLK_F8,
+	/* 0x58 */ SDLK_F9, SDLK_F10, SDLK_NUMLOCK, SDLK_SCROLLOCK, SDLK_KP_DIVIDE, SDLK_KP_MULTIPLY, SDLK_KP_PLUS, SDLK_F12,
+	/* 0x60 */ SDLK_LSHIFT, SDLK_RSHIFT, SDLK_CAPSLOCK, SDLK_LCTRL, SDLK_LALT, SDLK_RALT, SDLK_LSUPER, SDLK_RSUPER,
+	/* 0x68 */ SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_MENU, SDLK_UNKNOWN, SDLK_PRINT, SDLK_PAUSE, SDLK_F12,
+	/* 0x70 */ SDLK_HOME, SDLK_END, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN,
+	/* 0x78 */ SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN, SDLK_UNKNOWN
+};
+
+static SDLMod wos_mod(unsigned int qual) {
+	int m = KMOD_NONE;
+	if (qual & 0x0001) m |= KMOD_LSHIFT;	/* IEQUALIFIER_LSHIFT */
+	if (qual & 0x0002) m |= KMOD_RSHIFT;	/* IEQUALIFIER_RSHIFT */
+	if (qual & 0x0004) m |= KMOD_CAPS;	/* IEQUALIFIER_CAPSLOCK */
+	if (qual & 0x0008) m |= KMOD_LCTRL;	/* IEQUALIFIER_CONTROL */
+	if (qual & 0x0010) m |= KMOD_LALT;	/* IEQUALIFIER_LALT */
+	if (qual & 0x0020) m |= KMOD_RALT;	/* IEQUALIFIER_RALT */
+	return (SDLMod)m;
+}
+
+/* The next window event as an SDL_Event; false when none is queued. Call
+ * WOS_Video_Poll() first to read the window port. */
+static bool WOS_NextSDLEvent(SDL_Event *event) {
+	WOS_VideoEvent ev;
+	while (WOS_Video_NextEvent(&ev)) {
+		memset(event,0,sizeof(*event));
+		switch (ev.type) {
+		case WOS_EV_KEY: {
+			const SDLKey sym = wos_keymap[ev.code & 0x7f];
+			if (sym == SDLK_UNKNOWN) continue;
+			event->type = ev.down ? SDL_KEYDOWN : SDL_KEYUP;
+			event->key.type = event->type;
+			event->key.state = ev.down ? SDL_PRESSED : SDL_RELEASED;
+			event->key.keysym.scancode = (Uint8)ev.code;
+			event->key.keysym.sym = sym;
+			event->key.keysym.mod = wos_mod(ev.qual);
+			return true;
+		}
+		case WOS_EV_MOTION:
+			event->type = SDL_MOUSEMOTION;
+			event->motion.type = SDL_MOUSEMOTION;
+			event->motion.xrel = (Sint16)ev.dx;
+			event->motion.yrel = (Sint16)ev.dy;
+			event->motion.x = (Uint16)(sdl.clip.x + sdl.clip.w / 2);
+			event->motion.y = (Uint16)(sdl.clip.y + sdl.clip.h / 2);
+			return true;
+		case WOS_EV_BUTTON:
+			event->type = ev.down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+			event->button.type = event->type;
+			event->button.button = (Uint8)ev.code;
+			event->button.state = ev.down ? SDL_PRESSED : SDL_RELEASED;
+			return true;
+		case WOS_EV_QUIT:
+			event->type = SDL_QUIT;
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+
 #define SETMODE_SAVES 1  //Don't set Video Mode if nothing changes.
 #define SETMODE_SAVES_CLEAR 1 //Clear the screen, when the Video Mode is reused
 SDL_Surface* SDL_SetVideoMode_Wrap(int width,int height,int bpp,Bit32u flags){
@@ -281,6 +411,14 @@ SDL_Surface* SDL_SetVideoMode_Wrap(int width,int height,int bpp,Bit32u flags){
 	SDL_Surface* s = SDL_SetVideoMode(width,height,bpp,flags);
 #if SETMODE_SAVES
 	if (s == NULL) return s; //Only store when successful
+#if defined(__WARPOS__)
+	/* WarpOS SDL does not present a new window/screen until rectangles are
+	 * updated; DOSBox only updates changed lines, so present it once. */
+	if (!(flags & SDL_OPENGL)) {
+		SDL_FillRect(s,NULL,SDL_MapRGB(s->format,0,0,0));
+		SDL_UpdateRect(s,0,0,0,0);
+	}
+#endif
 	i_height = height;
 	i_width = width;
 	i_bpp = bpp;
@@ -315,7 +453,7 @@ static unsigned char logo[32*32*4]= {
 #include "dosbox_logo.h"
 };
 static void GFX_SetIcon() {
-#if !defined(MACOSX)
+#if !defined(MACOSX) && !defined(__WARPOS__)	/* WarpOS: no SDL video (SDL_WM_SetIcon needs it) */
 	/* Set Icon (must be done before any sdl_setvideomode call) */
 	/* But don't set it on OS X, as we use a nicer external icon there. */
 	/* Made into a separate call, so it can be called again when we restart the graphics output on win32 */
@@ -332,7 +470,11 @@ static void GFX_SetIcon() {
 static void KillSwitch(bool pressed) {
 	if (!pressed)
 		return;
+#if C_NO_EXCEPTIONS
+	DOSBOX_Quit();
+#else
 	throw 1;
+#endif
 }
 
 static void PauseDOSBox(bool pressed) {
@@ -343,12 +485,27 @@ static void PauseDOSBox(bool pressed) {
 	KEYBOARD_ClrBuffer();
 	SDL_Delay(500);
 	SDL_Event event;
+#if defined(__WARPOS__)
+	WOS_Video_Poll();
+	while (WOS_NextSDLEvent(&event)) {
+		// flush event queue.
+	}
+#else
 	while (SDL_PollEvent(&event)) {
 		// flush event queue.
 	}
+#endif
 
 	while (paused) {
+#if defined(__WARPOS__)
+		WOS_Video_Poll();
+		if (!WOS_NextSDLEvent(&event)) {
+			SDL_Delay(20);
+			continue;
+		}
+#else
 		SDL_WaitEvent(&event);    // since we're not polling, cpu usage drops to 0.
+#endif
 		switch (event.type) {
 
 			case SDL_QUIT: KillSwitch(true); break;
@@ -540,6 +697,10 @@ Bitu GFX_SetSize(Bitu width,Bitu height,Bitu flags,double scalex,double scaley,G
 	sdl.draw.callback=callback;
 	sdl.draw.scalex=scalex;
 	sdl.draw.scaley=scaley;
+
+#if defined(__WARPOS__)
+	return WOS_SetSize(width,height,flags);
+#endif
 
 	int bpp=0;
 	Bitu retFlags = 0;
@@ -876,6 +1037,9 @@ void sticky_keys(bool restore){
 #endif
 
 void GFX_SwitchFullScreen(void) {
+#if defined(__WARPOS__)
+	return;	/* always full screen */
+#endif
 	sdl.desktop.fullscreen=!sdl.desktop.fullscreen;
 	if (sdl.desktop.fullscreen) {
 		if (!sdl.mouse.locked) GFX_CaptureMouse();
@@ -923,9 +1087,45 @@ void GFX_RestoreMode(void) {
 }
 
 
+#if defined(__WARPOS__)
+/* Profiled wrappers (see src/platform/warpos/wos_prof.h); the real
+ * functions below are compiled under the _Impl names. */
+#include "wos_prof.h"
+bool GFX_StartUpdate_Impl(Bit8u * & pixels,Bitu & pitch);
+void GFX_EndUpdate_Impl(const Bit16u *changedLines);
+void GFX_SetPalette_Impl(Bitu start,Bitu count,GFX_PalEntry * entries);
+bool GFX_StartUpdate(Bit8u * & pixels,Bitu & pitch) {
+	WOS_PROF_BEGIN(WOS_PROF_STARTUPD);
+	const bool r = GFX_StartUpdate_Impl(pixels,pitch);
+	WOS_PROF_END(WOS_PROF_STARTUPD);
+	return r;
+}
+void GFX_EndUpdate(const Bit16u *changedLines) {
+	WOS_PROF_BEGIN(WOS_PROF_ENDUPD);
+	GFX_EndUpdate_Impl(changedLines);
+	WOS_PROF_END(WOS_PROF_ENDUPD);
+	wos_prof_frames++;
+}
+void GFX_SetPalette(Bitu start,Bitu count,GFX_PalEntry * entries) {
+	WOS_PROF_BEGIN(WOS_PROF_PALETTE);
+	GFX_SetPalette_Impl(start,count,entries);
+	WOS_PROF_END(WOS_PROF_PALETTE);
+}
+#define GFX_StartUpdate GFX_StartUpdate_Impl
+#define GFX_EndUpdate GFX_EndUpdate_Impl
+#define GFX_SetPalette GFX_SetPalette_Impl
+#endif
+
 bool GFX_StartUpdate(Bit8u * & pixels,Bitu & pitch) {
 	if (!sdl.active || sdl.updating)
 		return false;
+#if defined(__WARPOS__)
+	if (!wos.pic) return false;
+	pixels = wos.pic;
+	pitch = wos.pitch;
+	sdl.updating = true;
+	return true;
+#endif
 	switch (sdl.desktop.type) {
 	case SCREEN_SURFACE:
 		if (sdl.blit.surface) {
@@ -988,6 +1188,25 @@ void GFX_EndUpdate( const Bit16u *changedLines ) {
 	if (!sdl.updating)
 		return;
 	sdl.updating=false;
+#if defined(__WARPOS__)
+	/* changedLines alternates unchanged/changed row counts; copy only the
+	 * changed rows, all under one bitmap lock. */
+	if (changedLines) {
+		Bitu y = 0, index = 0;
+		int nranges = 0;
+		while (y < sdl.draw.height && nranges < 1024) {
+			if ((index & 1) && changedLines[index]) {
+				wos.ranges[nranges * 2] = (int)y;
+				wos.ranges[nranges * 2 + 1] = changedLines[index];
+				nranges++;
+			}
+			y += changedLines[index];
+			index++;
+		}
+		WOS_Video_Present(wos.pic,(int)wos.pitch,sdl.clip.w,sdl.clip.x,sdl.clip.y,wos.ranges,nranges);
+	}
+	return;
+#endif
 	switch (sdl.desktop.type) {
 	case SCREEN_SURFACE:
 		if (SDL_MUSTLOCK(sdl.surface)) {
@@ -1111,6 +1330,9 @@ void GFX_EndUpdate( const Bit16u *changedLines ) {
 
 
 void GFX_SetPalette(Bitu start,Bitu count,GFX_PalEntry * entries) {
+#if defined(__WARPOS__)
+	return;	/* 15/16-bit only: the renderer maps colours with GFX_GetRGB */
+#endif
 	/* I should probably not change the GFX_PalEntry :) */
 	if (sdl.surface->flags & SDL_HWPALETTE) {
 		if (!SDL_SetPalette(sdl.surface,SDL_PHYSPAL,(SDL_Color *)entries,start,count)) {
@@ -1122,6 +1344,12 @@ void GFX_SetPalette(Bitu start,Bitu count,GFX_PalEntry * entries) {
 		}
 	}
 }
+
+#if defined(__WARPOS__)
+#undef GFX_StartUpdate
+#undef GFX_EndUpdate
+#undef GFX_SetPalette
+#endif
 
 
 void GFX_Stop() {
@@ -1231,6 +1459,9 @@ static void GUI_StartUp(Section * sec) {
 	sdl.desktop.lazy_fullscreen_req=false;
 
 	sdl.desktop.fullscreen=section->Get_bool("fullscreen");
+#if defined(__WARPOS__)
+	sdl.desktop.fullscreen=true;	/* native screen only */
+#endif
 	sdl.wait_on_error=section->Get_bool("waitonerror");
 
 	Prop_multival* p=section->Get_multival("priority");
@@ -1412,6 +1643,13 @@ static void GUI_StartUp(Section * sec) {
 #endif	//OPENGL
 	/* Initialize screen for first time */
 
+#if defined(__WARPOS__)
+	/* The native screen opens with the first GFX_SetSize; no SDL window
+	 * and no splash (an SDL surface blit loop). */
+	sdl.desktop.bpp=16;
+	GFX_Stop();
+	atexit(WOS_Video_Close);
+#else
 	sdl.surface=SDL_SetVideoMode_Wrap(640,400,0,0);
 
 	if (sdl.surface == NULL) E_Exit("Could not initialize video: %s",SDL_GetError());
@@ -1493,6 +1731,7 @@ static void GUI_StartUp(Section * sec) {
 		delete [] tmpbufp;
 
 	}
+#endif /* !__WARPOS__ */
 
 	/* Get some Event handlers */
 	MAPPER_AddHandler(KillSwitch,MK_f9,MMOD1,"shutdown","ShutDown");
@@ -1613,7 +1852,14 @@ void GFX_Events() {
 		MAPPER_UpdateJoysticks();
 	}
 #endif
+#if defined(__WARPOS__)
+	/* The native window: one SetSignal, GetMsg only when it has messages
+	 * (an SDL pump was a GetMsg plus a lowlevel joystick read, several ms). */
+	WOS_Video_Poll();
+	while (WOS_NextSDLEvent(&event)) {
+#else
 	while (SDL_PollEvent(&event)) {
+#endif
 #if SDL_XORG_FIX
 		// Special code for broken SDL with Xorg 1.20.1, where pairs of inputfocus gain and loss events are generated
 		// when locking the mouse in windowed mode.
@@ -1679,7 +1925,13 @@ void GFX_Events() {
 						SDL_WaitEvent(&ev);
 
 						switch (ev.type) {
-						case SDL_QUIT: throw(0); break; // a bit redundant at linux at least as the active events gets before the quit event.
+						case SDL_QUIT:
+#if C_NO_EXCEPTIONS
+							DOSBOX_Quit();
+#else
+							throw(0);
+#endif
+							break; // a bit redundant at linux at least as the active events gets before the quit event.
 						case SDL_ACTIVEEVENT:     // wait until we get window focus back
 							if (ev.active.state & (SDL_APPINPUTFOCUS | SDL_APPACTIVE)) {
 								// We've got focus back, so unpause and break out of the loop
@@ -1712,7 +1964,11 @@ void GFX_Events() {
 //			HandleVideoResize(&event.resize);
 			break;
 		case SDL_QUIT:
+#if C_NO_EXCEPTIONS
+			DOSBOX_Quit();
+#else
 			throw(0);
+#endif
 			break;
 		case SDL_VIDEOEXPOSE:
 			if (sdl.draw.callback) sdl.draw.callback( GFX_CallBackRedraw );
@@ -2032,12 +2288,41 @@ static void erasemapperfile() {
 }
 
 
+static void ShowExitError(const char * error) {
+#if defined (WIN32)
+	sticky_keys(true);
+#endif
+	GFX_ShowMsg("Exit to error: %s",error);
+	fflush(NULL);
+	if(sdl.wait_on_error) {
+		//TODO Maybe look for some way to show message in linux?
+#if (C_DEBUG)
+		GFX_ShowMsg("Press enter to continue");
+		fflush(NULL);
+		fgetc(stdin);
+#elif defined(WIN32)
+		Sleep(5000);
+#endif
+	}
+}
+
 //extern void UI_Init(void);
 int main(int argc, char* argv[]) {
+#if C_NO_EXCEPTIONS
+	{
+	/* Constructed before setjmp so that their destructors (which shut the
+	 * sections down) still run after a longjmp from E_Exit or a quit. */
+	CommandLine com_line(argc,argv);
+	Config myconf(&com_line);
+	control=&myconf;
+	if (setjmp(dosbox_exit_jmp) == 0) {
+		dosbox_exit_armed = true;
+#else
 	try {
 		CommandLine com_line(argc,argv);
 		Config myconf(&com_line);
 		control=&myconf;
+#endif
 		/* Init the configuration system and add default values */
 		Config_Add_SDL();
 		DOSBOX_Init();
@@ -2079,6 +2364,9 @@ int main(int argc, char* argv[]) {
 			printf("DOSBox comes with ABSOLUTELY NO WARRANTY.  This is free software,\n");
 			printf("and you are welcome to redistribute it under certain conditions;\n");
 			printf("please read the COPYING file thoroughly before doing so.\n\n");
+#if C_NO_EXCEPTIONS
+			dosbox_exit_armed = false;
+#endif
 			return 0;
 		}
 		if(control->cmdline->FindExist("-printconf")) printconfiglocation();
@@ -2117,12 +2405,19 @@ int main(int argc, char* argv[]) {
 #endif
 	// Don't init timers, GetTicks seems to work fine and they can use a fair amount of power (Macs again) 
 	// Please report problems with audio and other things.
+#if defined(__WARPOS__)
+	/* Audio only: the screen and input are native (wos_video.c), and SDL's
+	 * joystick polling is a lowlevel.library call per read. */
+	if ( SDL_Init( SDL_INIT_AUDIO | SDL_INIT_CDROM | SDL_INIT_NOPARACHUTE ) < 0 )
+		E_Exit("Can't init SDL %s",SDL_GetError());
+#else
 	if ( SDL_Init( SDL_INIT_AUDIO|SDL_INIT_VIDEO | /*SDL_INIT_TIMER |*/ SDL_INIT_CDROM
 		|SDL_INIT_NOPARACHUTE
 		) < 0 ) E_Exit("Can't init SDL %s",SDL_GetError());
+#endif
 	sdl.inited = true;
 
-#ifndef DISABLE_JOYSTICK
+#if !defined(DISABLE_JOYSTICK) && !defined(__WARPOS__)
 	//Initialise Joystick separately. This way we can warn when it fails instead
 	//of exiting the application
 	if( SDL_InitSubSystem(SDL_INIT_JOYSTICK) < 0 ) LOG_MSG("Failed to init joystick support");
@@ -2248,23 +2543,15 @@ int main(int argc, char* argv[]) {
 		/* Start up main machine */
 		control->StartUp();
 		/* Shutdown everything */
+#if C_NO_EXCEPTIONS
+		dosbox_exit_armed = false;
+	} else if (dosbox_exit_error) {
+		ShowExitError(dosbox_exit_error);
+	} // else: quit or pressed killswitch
+	}
+#else
 	} catch (char * error) {
-#if defined (WIN32)
-		sticky_keys(true);
-#endif
-		GFX_ShowMsg("Exit to error: %s",error);
-		fflush(NULL);
-		if(sdl.wait_on_error) {
-			//TODO Maybe look for some way to show message in linux?
-#if (C_DEBUG)
-			GFX_ShowMsg("Press enter to continue");
-			fflush(NULL);
-			fgetc(stdin);
-#elif defined(WIN32)
-			Sleep(5000);
-#endif
-		}
-
+		ShowExitError(error);
 	}
 	catch (int){
 		; //nothing, pressed killswitch
@@ -2272,6 +2559,7 @@ int main(int argc, char* argv[]) {
 	catch(...){
 		; // Unknown error, let's just exit.
 	}
+#endif
 #if defined (WIN32)
 	sticky_keys(true); //Might not be needed if the shutdown function switches to windowed mode, but it doesn't hurt
 #endif
